@@ -139,10 +139,12 @@ def run_left_side_strategy(df_target, df_taiex, df_futures):
             else: return "平水雜訊"
     df['Basis_State'] = df.apply(categorize_basis, axis=1)
     
-    # --- 倉位狀態機 (分批網格建倉) ---
+    # 宣告在迴圈外部的追蹤變數
     positions = np.zeros(len(df))
     current_pos = 0.0
-    
+    holding_peak = 0.0
+    is_cooldown = False
+
     for i in range(1, len(df)):
         rsi = df['RSI'].iloc[i]
         bias = df['BIAS'].iloc[i]
@@ -151,39 +153,57 @@ def run_left_side_strategy(df_target, df_taiex, df_futures):
         ma20 = df['MA20'].iloc[i]
         ma60 = df['MA60'].iloc[i] 
         
+        # 1. 繼承昨日倉位
         target_pos = current_pos
         
-        # --- 狀態切換 (Regime Switching) 終極雙引擎 ---
-        is_bull_trend = close > ma60  # 判斷是否站上季線，進入多頭/主升段領域
+        # 2. 判斷是否解除冷卻期 (空手且市場回溫時，解除鎖定)
+        if target_pos == 0:
+            holding_peak = 0.0
+            if rsi > 50 or close > ma20:
+                is_cooldown = False
+
+        # 3. 狀態切換 (Regime Switching) 雙引擎邏輯
+        is_bull_trend = close > ma60  
         
         if is_bull_trend:
             # ==========================================
-            # 【右側趨勢引擎】(多頭模式：追高殺低)
+            # 【右側趨勢引擎】(多頭模式)
             # ==========================================
-            # 在主升段中，RSI 不可能跌到 30 讓你撿便宜。
-            # 只要價格站穩 20 日線 (MA20)，代表動能強勁，直接無腦滿倉上車！
             if close > ma20:
-                target_pos = 1.0
-            # 如果跌破 20 日線，代表多頭遭遇較深的回檔，暫時全數獲利了結觀望
+                if not is_cooldown: # 確保冷卻期內不准無腦追高
+                    target_pos = 1.0
             else:
                 target_pos = 0.0
-                
         else:
             # ==========================================
-            # 【左側反彈引擎】(空頭模式：網格接刀)
+            # 【左側反彈引擎】(空頭模式)
             # ==========================================
-            # 1. 停利條件：反彈碰到 20 日線或 RSI 回溫到 50，立刻逃跑
+            # 停利：反彈碰到月線或 RSI 轉強
             if close >= ma20 or rsi > 50:
                 target_pos = 0.0
+            
+            # 進場：向下攤平網格 (必須在非冷卻期才允許接刀)
+            if not is_cooldown:
+                if rsi < 20 or bias < -12:
+                    target_pos = max(target_pos, 1.0)
+                elif rsi < 25 or close < lower_bb:
+                    target_pos = max(target_pos, 0.6)
+                elif rsi < 32 or bias < -6:
+                    target_pos = max(target_pos, 0.3)
 
-            # 2. 進場條件：極端恐慌才往下攤平 (網格加碼)
-            if rsi < 20 or bias < -12:
-                target_pos = max(target_pos, 1.0)
-            elif rsi < 25 or close < lower_bb:
-                target_pos = max(target_pos, 0.6)
-            elif rsi < 32 or bias < -6:
-                target_pos = max(target_pos, 0.3)
-                
+        # ==========================================
+        # 4. 🚨 絕對優先權：20% 追蹤停損 (修復覆蓋 Bug) 🚨
+        # ==========================================
+        # 無論上面的雙引擎做出什麼決定，只要虧損達到 20%，強制清倉！
+        if current_pos > 0:
+            holding_peak = max(holding_peak, close) # 持續推升最高價紀錄
+            
+            # 當價格從持倉高點下跌 20% 時，強制斷尾求生
+            if close <= holding_peak * 0.80:
+                target_pos = 0.0
+                is_cooldown = True  # 鎖死買進功能，直到市場回溫
+
+        # 5. 更新狀態
         positions[i] = target_pos
         current_pos = target_pos
 
