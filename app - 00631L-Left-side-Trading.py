@@ -142,7 +142,7 @@ def run_left_side_strategy(df_target, df_taiex, df_futures):
     # 宣告在迴圈外部的追蹤變數
     positions = np.zeros(len(df))
     current_pos = 0.0
-    holding_peak = 0.0
+    avg_cost = 0.0       # 🚨 新增：記錄平均持有成本
     is_cooldown = False
 
     for i in range(1, len(df)):
@@ -156,9 +156,9 @@ def run_left_side_strategy(df_target, df_taiex, df_futures):
         # 1. 繼承昨日倉位
         target_pos = current_pos
         
-        # 2. 判斷是否解除冷卻期 (空手且市場回溫時，解除鎖定)
+        # 2. 判斷是否解除冷卻期
         if target_pos == 0:
-            holding_peak = 0.0
+            avg_cost = 0.0 # 確保空手時成本歸零
             if rsi > 50 or close > ma20:
                 is_cooldown = False
 
@@ -170,7 +170,7 @@ def run_left_side_strategy(df_target, df_taiex, df_futures):
             # 【右側趨勢引擎】(多頭模式)
             # ==========================================
             if close > ma20:
-                if not is_cooldown: # 確保冷卻期內不准無腦追高
+                if not is_cooldown:
                     target_pos = 1.0
             else:
                 target_pos = 0.0
@@ -192,16 +192,27 @@ def run_left_side_strategy(df_target, df_taiex, df_futures):
                     target_pos = max(target_pos, 0.3)
 
         # ==========================================
-        # 4. 🚨 絕對優先權：20% 追蹤停損 (修復覆蓋 Bug) 🚨
+        # 🚨 新增核心：動態計算加權平均成本 🚨
         # ==========================================
-        # 無論上面的雙引擎做出什麼決定，只要虧損達到 20%，強制清倉！
-        if current_pos > 0:
-            holding_peak = max(holding_peak, close) # 持續推升最高價紀錄
-            
-            # 當價格從持倉高點下跌 20% 時，強制斷尾求生
-            if close <= holding_peak * 0.80:
+        # 只要目標倉位大於當前倉位，代表有「新買進」動作，必須重新計算成本
+        if target_pos > current_pos:
+            if current_pos == 0:
+                avg_cost = close
+            else:
+                # 計算加權平均成本：(舊成本*舊倉位 + 新價格*新增倉位) / 總倉位
+                avg_cost = (avg_cost * current_pos + close * (target_pos - current_pos)) / target_pos
+        elif target_pos == 0:
+            avg_cost = 0.0
+
+        # ==========================================
+        # 4. 🚨 絕對優先權：15% 固定停損 (依據平均成本) 🚨
+        # ==========================================
+        # 無論雙引擎怎麼判定，只要跌破「平均持有成本的 15%」，強制清倉！
+        if current_pos > 0 and avg_cost > 0:
+            if close <= avg_cost * 0.85:
                 target_pos = 0.0
                 is_cooldown = True  # 鎖死買進功能，直到市場回溫
+                avg_cost = 0.0      # 成本歸零
 
         # 5. 更新狀態
         positions[i] = target_pos
