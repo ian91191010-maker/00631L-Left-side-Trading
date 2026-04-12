@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 # 網頁 UI 設定
 # ==========================================
 st.set_page_config(page_title="左側極值網格防禦策略", layout="wide")
-st.title("00631L.TW 左側均值回歸 (V3)")
+st.title("00631L.TW 左側均值回歸 (網格建倉)")
 
 st.sidebar.subheader("資料源設定")
 finmind_token = st.sidebar.text_input("FinMind API Token", type="password")
@@ -149,33 +149,38 @@ def run_left_side_strategy(df_target, df_taiex, df_futures):
         close = df['Adj_Close'].iloc[i]
         lower_bb = df['BB_Lower'].iloc[i]
         ma20 = df['MA20'].iloc[i]
-        ma60 = df['MA60'].iloc[i] # 取得當日季線位置
+        ma60 = df['MA60'].iloc[i] 
         
         target_pos = current_pos
         
-        # --- 狀態切換 (Regime Switching) 混合出場機制 ---
-        is_bull_trend = close > ma60  # 判斷是否站上季線，進入主升段
+        # --- 狀態切換 (Regime Switching) 終極雙引擎 ---
+        is_bull_trend = close > ma60  # 判斷是否站上季線，進入多頭/主升段領域
         
         if is_bull_trend:
-            # 【右側趨勢模式】價格站上季線，放寬停利標準，讓利潤奔跑
-            # 只有當強勢跌破 20 日均線時，才獲利了結 (忽視 RSI 過熱訊號)
-            if close < ma20:
+            # ==========================================
+            # 【右側趨勢引擎】(多頭模式：追高殺低)
+            # ==========================================
+            # 在主升段中，RSI 不可能跌到 30 讓你撿便宜。
+            # 只要價格站穩 20 日線 (MA20)，代表動能強勁，直接無腦滿倉上車！
+            if close > ma20:
+                target_pos = 1.0
+            # 如果跌破 20 日線，代表多頭遭遇較深的回檔，暫時全數獲利了結觀望
+            else:
                 target_pos = 0.0
+                
         else:
-            # 【左側反彈模式】價格在季線之下，嚴格執行見好就收
-            # 只要碰到 20 日線或 RSI 回溫到 50，立刻逃跑
+            # ==========================================
+            # 【左側反彈引擎】(空頭模式：網格接刀)
+            # ==========================================
+            # 1. 停利條件：反彈碰到 20 日線或 RSI 回溫到 50，立刻逃跑
             if close >= ma20 or rsi > 50:
                 target_pos = 0.0
 
-        # --- 進場條件不變 (網格向下加碼) ---
-        if target_pos > 0 or (target_pos == 0 and current_pos == 0): # 避免剛停利又馬上同日進場
-            # Level 3: 極度恐慌 (打滿 100%)
+            # 2. 進場條件：極端恐慌才往下攤平 (網格加碼)
             if rsi < 20 or bias < -12:
                 target_pos = max(target_pos, 1.0)
-            # Level 2: 嚴重超賣 (建倉至 60%)
             elif rsi < 25 or close < lower_bb:
                 target_pos = max(target_pos, 0.6)
-            # Level 1: 恐慌初現 (試單 30%)
             elif rsi < 32 or bias < -6:
                 target_pos = max(target_pos, 0.3)
                 
