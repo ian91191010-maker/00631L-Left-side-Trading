@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 # 網頁 UI 設定
 # ==========================================
 st.set_page_config(page_title="左側極值網格防禦策略", layout="wide")
-st.title("00631L.TW 左側均值回歸 (網格建倉)")
+st.title("00631L.TW 左側交易策略")
 
 st.sidebar.subheader("資料源設定")
 finmind_token = st.sidebar.text_input("FinMind API Token", type="password")
@@ -354,23 +354,55 @@ if st.sidebar.button("執行左側網格策略運算"):
                 # ==========================================
                 st.header("區域二：左側極值監控表")
                 view_df = result_df.tail(15).copy()
+
+                # --- 🚨 核心視覺修復：將指標逆向還原至券商真實報價維度 ---
+                split_date = pd.to_datetime('2026-03-31')
+                split_ratio = 22.0
+                
+                # 若為分割前的歷史日期，將計算出來的還原指標乘回 22 倍，對齊實際報價
+                mask = view_df.index < split_date
+                view_df.loc[mask, 'BB_Lower'] = view_df.loc[mask, 'BB_Lower'] * split_ratio
+                view_df.loc[mask, 'MA20'] = view_df.loc[mask, 'MA20'] * split_ratio
+
                 view_df.index = view_df.index.strftime('%Y-%m-%d')
                 view_df.index.name = '日期'
 
+                # 價差狀態文字轉換
                 def map_basis_ui(state):
                     if state == "極端正價差": return "⚠️ 情緒過熱"
                     elif state == "微幅正價差": return "🔥 軋空起手"
                     elif state == "實質逆價差": return "🛡️ 轉倉紅利"
                     elif state == "假性逆價差": return "❄️ 除息干擾"
                     else: return "⚖️ 價差平水"
-                    
                 view_df['籌碼觀測'] = view_df['Basis_State'].apply(map_basis_ui)
-                view_df['RSI(恐慌度)'] = view_df['RSI'].round(1).astype(str) + " (低於30警戒)"
-                view_df['負乖離率'] = view_df['BIAS'].round(2).astype(str) + "%"
 
+                # --- UI 優化 1：RSI 直觀顯示 ---
+                def format_rsi(r):
+                    if pd.isna(r): return "-"
+                    if r < 20: return f"🩸 {r:.1f} (極恐慌)"
+                    elif r < 32: return f"⚠️ {r:.1f} (超賣)"
+                    elif r > 70: return f"🔥 {r:.1f} (過熱)"
+                    else: return f" {r:.1f} (平靜)"
+                view_df['RSI(恐慌度)'] = view_df['RSI'].apply(format_rsi)
+
+                # --- UI 優化 2：負乖離率格式化 ---
+                view_df['負乖離率'] = view_df['BIAS'].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "-")
+
+                # --- UI 優化 3：所有價格統一對齊小數點後 2 位 ---
+                view_df['Close'] = view_df['Close'].apply(lambda x: f"{x:.2f}")
+                view_df['BB_Lower'] = view_df['BB_Lower'].apply(lambda x: f"{x:.2f}")
+                view_df['MA20'] = view_df['MA20'].apply(lambda x: f"{x:.2f}")
+
+                # 篩選欄位與重命名
                 display_cols = ['Close', 'RSI(恐慌度)', '負乖離率', 'BB_Lower', 'MA20', '籌碼觀測', 'Position', 'Action']
                 view_df = view_df[display_cols]
-                view_df = view_df.rename(columns={'Close': '實際報價', 'BB_Lower': '布林下軌', 'MA20': '月均線(停利點)', 'Position': '目標倉位(%)'})
+                view_df = view_df.rename(columns={
+                    'Close': '券商實際報價', 
+                    'BB_Lower': '布林下軌(接刀點)', 
+                    'MA20': '月均線(停利點)', 
+                    'Position': '目標倉位(%)'
+                })
+                
                 view_df['目標倉位(%)'] = (view_df['目標倉位(%)'] * 100).astype(int).astype(str) + "%"
 
                 st.dataframe(view_df.style.map(
