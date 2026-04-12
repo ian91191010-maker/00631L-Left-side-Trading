@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 # 網頁 UI 設定
 # ==========================================
 st.set_page_config(page_title="左側極值網格防禦策略", layout="wide")
-st.title("00631L.TW 左側均值回歸 (網格建倉)")
+st.title("00631L.TW 左側均值回歸 (V3)")
 
 st.sidebar.subheader("資料源設定")
 finmind_token = st.sidebar.text_input("FinMind API Token", type="password")
