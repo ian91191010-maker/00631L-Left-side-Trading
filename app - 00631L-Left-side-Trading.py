@@ -116,6 +116,8 @@ def run_left_side_strategy(df_target, df_taiex, df_futures):
     # 3. 負乖離率 (BIAS)
     df['BIAS'] = (df['Adj_Close'] - df['MA20']) / df['MA20'] * 100
 
+    df['MA60'] = df['Adj_Close'].rolling(window=60).mean()
+
     # 4. 期現貨籌碼觀測 (作為輔助)
     df_futures = df_futures.reindex(df.index).ffill()
     df['Basis'] = df_futures['Futures_Close'] - df_taiex['Close']
@@ -147,14 +149,26 @@ def run_left_side_strategy(df_target, df_taiex, df_futures):
         close = df['Adj_Close'].iloc[i]
         lower_bb = df['BB_Lower'].iloc[i]
         ma20 = df['MA20'].iloc[i]
+        ma60 = df['MA60'].iloc[i] # 取得當日季線位置
         
         target_pos = current_pos
         
-        # 【出場條件】均值回歸：只要價格反彈碰到 20日線，或 RSI 回溫至 50，無條件獲利了結
-        if close >= ma20 or rsi > 50:
-            target_pos = 0.0
+        # --- 狀態切換 (Regime Switching) 混合出場機制 ---
+        is_bull_trend = close > ma60  # 判斷是否站上季線，進入主升段
+        
+        if is_bull_trend:
+            # 【右側趨勢模式】價格站上季線，放寬停利標準，讓利潤奔跑
+            # 只有當強勢跌破 20 日均線時，才獲利了結 (忽視 RSI 過熱訊號)
+            if close < ma20:
+                target_pos = 0.0
         else:
-            # 【進場條件】網格向下加碼 (只增不減，直到觸發出場)
+            # 【左側反彈模式】價格在季線之下，嚴格執行見好就收
+            # 只要碰到 20 日線或 RSI 回溫到 50，立刻逃跑
+            if close >= ma20 or rsi > 50:
+                target_pos = 0.0
+
+        # --- 進場條件不變 (網格向下加碼) ---
+        if target_pos > 0 or (target_pos == 0 and current_pos == 0): # 避免剛停利又馬上同日進場
             # Level 3: 極度恐慌 (打滿 100%)
             if rsi < 20 or bias < -12:
                 target_pos = max(target_pos, 1.0)
