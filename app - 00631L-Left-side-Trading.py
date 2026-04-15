@@ -10,21 +10,50 @@ from datetime import datetime, timedelta
 # 網頁 UI 設定
 # ==========================================
 st.set_page_config(page_title="左側極值網格防禦策略", layout="wide")
-st.title("00631L.TW 左側交易策略")
+
+# 3. 主題改 [00631L 交易策略]，置中，字體縮小約 25% (使用 h2 標籤替代原本的 title)
+st.markdown("<h2 style='text-align: center;'>[00631L 交易策略]</h2>", unsafe_allow_html=True)
+
+# 1. 左側 token 改成用 Secrets 內建讀取
+try:
+    finmind_token = st.secrets["FINMIND_TOKEN"]
+except:
+    finmind_token = ""  # 防呆機制，若未設定則為空字串
 
 st.sidebar.subheader("資料源設定")
-finmind_token = st.sidebar.text_input("FinMind API Token", type="password")
 lookback_years = st.sidebar.number_input("回測年數", min_value=1, max_value=10, value=5)
 plot_days = st.sidebar.slider("圖表顯示天數 (0為顯示全部)", 0, 1500, 0, step=50)
+
+# 2. 策略運算獨立執行按鈕
+btn_run_strategy = st.sidebar.button("▶️ 執行策略運算")
 
 ticker = "00631L"
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("資金回測與摩擦成本設定")
-bt_start_date = st.sidebar.date_input("回測起始日", datetime.strptime('2024-01-01', '%Y-%m-%d'))
+
+# 10. 改成可以設定回測起訖日期
+default_start = datetime.strptime('2024-01-01', '%Y-%m-%d').date()
+default_end = datetime.today().date()
+bt_dates = st.sidebar.date_input("回測區間", [default_start, default_end])
+
+if len(bt_dates) == 2:
+    bt_start_date, bt_end_date = bt_dates
+else:
+    bt_start_date, bt_end_date = bt_dates[0], bt_dates[0]
+
 initial_capital = st.sidebar.number_input("起始投入資金 (NTD)", min_value=10000, value=100000, step=10000)
 fee_rate = st.sidebar.number_input("券商單邊手續費率 (%)", value=0.1425, format="%.4f") / 100
 tax_rate = st.sidebar.number_input("ETF 賣出交易稅率 (%)", value=0.1, format="%.3f") / 100
+
+# 2. 資金回測獨立執行按鈕
+btn_run_backtest = st.sidebar.button("📊 執行資金回測")
+
+# 初始化 session state，讓獨立按鈕運作不干擾畫面
+if "result_df" not in st.session_state:
+    st.session_state.result_df = pd.DataFrame()
+if "show_backtest" not in st.session_state:
+    st.session_state.show_backtest = False
 
 # ==========================================
 # 資料獲取模組 
@@ -97,28 +126,28 @@ def fetch_futures_data(years, token):
         return pd.DataFrame()
 
 # ==========================================
-# 核心策略模組 (左側均值回歸與網格建倉)
+# 核心策略模組
 # ==========================================
-def run_left_side_strategy(df_target, df_taiex, df_futures):
+@st.cache_data(show_spinner=False)
+def get_strategy_results(ticker, lookback_years, token):
+    df_target = fetch_stock_data(ticker, lookback_years, token)
+    df_taiex = fetch_stock_data("TAIEX", lookback_years, token)
+    df_futures = fetch_futures_data(lookback_years, token)
+    
+    if df_target.empty or df_taiex.empty:
+        return pd.DataFrame()
+        
     df = df_target.copy()
     df_taiex = df_taiex.reindex(df.index).ffill()
     
-    # --- 左側極端指標 ---
-    # 1. RSI (過度恐慌偵測)
     df['RSI'] = ta.momentum.rsi(df['Adj_Close'], window=14)
-    
-    # 2. 布林通道 (價格乖離偵測)
     bb = ta.volatility.BollingerBands(df['Adj_Close'], window=20, window_dev=2.2)
     df['BB_Lower'] = bb.bollinger_lband()
     df['BB_Upper'] = bb.bollinger_hband()
     df['MA20'] = bb.bollinger_mavg()
-    
-    # 3. 負乖離率 (BIAS)
     df['BIAS'] = (df['Adj_Close'] - df['MA20']) / df['MA20'] * 100
-
     df['MA60'] = df['Adj_Close'].rolling(window=60).mean()
 
-    # 4. 期現貨籌碼觀測 (作為輔助)
     df_futures = df_futures.reindex(df.index).ffill()
     df['Basis'] = df_futures['Futures_Close'] - df_taiex['Close']
     df['Smooth_Basis'] = df['Basis'].rolling(window=5).mean()
@@ -139,10 +168,9 @@ def run_left_side_strategy(df_target, df_taiex, df_futures):
             else: return "平水雜訊"
     df['Basis_State'] = df.apply(categorize_basis, axis=1)
     
-    # 宣告在迴圈外部的追蹤變數
     positions = np.zeros(len(df))
     current_pos = 0.0
-    avg_cost = 0.0       # 🚨 新增：記錄平均持有成本
+    avg_cost = 0.0
     is_cooldown = False
 
     for i in range(1, len(df)):
@@ -153,89 +181,58 @@ def run_left_side_strategy(df_target, df_taiex, df_futures):
         ma20 = df['MA20'].iloc[i]
         ma60 = df['MA60'].iloc[i] 
         
-        # 1. 繼承昨日倉位
         target_pos = current_pos
         
-        # 2. 判斷是否解除冷卻期
         if target_pos == 0:
-            avg_cost = 0.0 # 確保空手時成本歸零
+            avg_cost = 0.0 
             if rsi > 50 or close > ma20:
                 is_cooldown = False
 
-        # 3. 狀態切換 (Regime Switching) 雙引擎邏輯
         is_bull_trend = close > ma60  
         
         if is_bull_trend:
-            # ==========================================
-            # 【右側趨勢引擎】(多頭模式)
-            # ==========================================
             if close > ma20:
-                if not is_cooldown:
-                    target_pos = 1.0
+                if not is_cooldown: target_pos = 1.0
             else:
                 target_pos = 0.0
         else:
-            # ==========================================
-            # 【左側反彈引擎】(空頭模式)
-            # ==========================================
-            # 停利：反彈碰到月線或 RSI 轉強
-            if close >= ma20 or rsi > 50:
-                target_pos = 0.0
-            
-            # 進場：向下攤平網格 (必須在非冷卻期才允許接刀)
+            if close >= ma20 or rsi > 50: target_pos = 0.0
             if not is_cooldown:
-                if rsi < 20 or bias < -12:
-                    target_pos = max(target_pos, 1.0)
-                elif rsi < 25 or close < lower_bb:
-                    target_pos = max(target_pos, 0.6)
-                elif rsi < 32 or bias < -6:
-                    target_pos = max(target_pos, 0.3)
+                if rsi < 20 or bias < -12: target_pos = max(target_pos, 1.0)
+                elif rsi < 25 or close < lower_bb: target_pos = max(target_pos, 0.6)
+                elif rsi < 32 or bias < -6: target_pos = max(target_pos, 0.3)
 
-        # ==========================================
-        # 🚨 新增核心：動態計算加權平均成本 🚨
-        # ==========================================
-        # 只要目標倉位大於當前倉位，代表有「新買進」動作，必須重新計算成本
         if target_pos > current_pos:
-            if current_pos == 0:
-                avg_cost = close
-            else:
-                # 計算加權平均成本：(舊成本*舊倉位 + 新價格*新增倉位) / 總倉位
-                avg_cost = (avg_cost * current_pos + close * (target_pos - current_pos)) / target_pos
+            if current_pos == 0: avg_cost = close
+            else: avg_cost = (avg_cost * current_pos + close * (target_pos - current_pos)) / target_pos
         elif target_pos == 0:
             avg_cost = 0.0
 
-        # ==========================================
-        # 4. 🚨 絕對優先權：15% 固定停損 (依據平均成本) 🚨
-        # ==========================================
-        # 無論雙引擎怎麼判定，只要跌破「平均持有成本的 15%」，強制清倉！
         if current_pos > 0 and avg_cost > 0:
             if close <= avg_cost * 0.85:
                 target_pos = 0.0
-                is_cooldown = True  # 鎖死買進功能，直到市場回溫
-                avg_cost = 0.0      # 成本歸零
+                is_cooldown = True 
+                avg_cost = 0.0      
 
-        # 5. 更新狀態
         positions[i] = target_pos
         current_pos = target_pos
 
     df['Position'] = positions
     df['Position_Shift'] = df['Position'].diff().fillna(0)
     
-    # 動態產生買賣 Action 標籤
     def map_action(shift):
         if shift > 0: return f"BUY (+{shift*100:.0f}%)"
-        elif shift < 0: 
-            return "SELL ALL" if shift <= -0.99 else f"SELL (部分)"
+        elif shift < 0: return "SELL ALL" if shift <= -0.99 else f"SELL (部分)"
         return ""
     
     df['Action'] = df['Position_Shift'].apply(map_action)
     return df
 
 # ==========================================
-# 資金回測模組 (支援網格分批買賣)
+# 資金回測模組 
 # ==========================================
-def calculate_equity_curve(df, start_date, initial_capital, fee_rate, tax_rate):
-    mask = df.index >= pd.to_datetime(start_date)
+def calculate_equity_curve(df, start_date, end_date, initial_capital, fee_rate, tax_rate):
+    mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
     if not mask.any(): return pd.DataFrame()
     
     btest_df = df.loc[mask].copy()
@@ -252,7 +249,6 @@ def calculate_equity_curve(df, start_date, initial_capital, fee_rate, tax_rate):
             current_exposure = btest_df['Position'].iloc[i-2] if i > 1 else 0.0
             shift = target_exposure - current_exposure
             
-            # 分批買進
             if shift > 0 and cash > 0:
                 current_equity = cash + (shares * today_open)
                 target_buy_value = current_equity * shift
@@ -265,10 +261,8 @@ def calculate_equity_curve(df, start_date, initial_capital, fee_rate, tax_rate):
                     cash = cash - cost - fee
                     shares += add_shares
                     
-            # 分批/全數賣出
             elif shift < 0 and shares > 0:
-                if target_exposure == 0:
-                    sell_shares = shares # 全賣
+                if target_exposure == 0: sell_shares = shares 
                 else:
                     proportion_to_sell = abs(shift) / current_exposure
                     sell_shares = np.floor(shares * proportion_to_sell)
@@ -288,161 +282,145 @@ def calculate_equity_curve(df, start_date, initial_capital, fee_rate, tax_rate):
     return btest_df
 
 # ==========================================
-# 執行與圖表渲染
+# 按鈕觸發邏輯與圖表渲染
 # ==========================================
-if st.sidebar.button("執行左側網格策略運算"):
+if btn_run_strategy:
     if not finmind_token:
-        st.error("執行中止：尚未輸入 FinMind API Token。")
+        st.error("🚨 尚未在 secrets.toml 設定 FinMind API Token。")
     else:
-        with st.spinner('正在獲取多維度市場資料並計算網格矩陣...'):
-            df_target = fetch_stock_data(ticker, lookback_years, finmind_token)
-            df_taiex = fetch_stock_data("TAIEX", lookback_years, finmind_token)
-            df_futures = fetch_futures_data(lookback_years, finmind_token)
+        with st.spinner('正在獲取資料並運算策略...'):
+            st.session_state.result_df = get_strategy_results(ticker, lookback_years, finmind_token)
+            st.session_state.show_backtest = False
+
+if btn_run_backtest:
+    if st.session_state.result_df.empty:
+        with st.spinner('正在獲取底層資料...'):
+            st.session_state.result_df = get_strategy_results(ticker, lookback_years, finmind_token)
+    st.session_state.show_backtest = True
+
+# 只要有跑過策略，就顯示主畫面
+if not st.session_state.result_df.empty:
+    result_df = st.session_state.result_df
+
+    # 4. 主題下新增顯示今日的日期、股價、action 的橫向圖塊
+    latest_row = result_df.iloc[-1]
+    last_date = latest_row.name.strftime('%Y-%m-%d')
+    last_price = f"{latest_row['Close']:.2f}"
+    last_action = latest_row['Action'] if latest_row['Action'] else "HOLD (持有/空手)"
+    
+    # 判斷 Action 顏色
+    action_bg = "#454545" # 預設灰色
+    if "BUY" in last_action: action_bg = "#2E7D32"  # 綠色
+    elif "SELL" in last_action: action_bg = "#C62828" # 紅色
+    
+    banner_html = f"""
+    <div style="display: flex; justify-content: center; gap: 15px; margin-bottom: 25px;">
+        <div style="background-color: #454545; color: white; padding: 12px 25px; border-radius: 6px; font-size: 18px; font-weight: bold; box-shadow: 2px 2px 5px rgba(0,0,0,0.5);">📅 {last_date}</div>
+        <div style="background-color: #454545; color: white; padding: 12px 25px; border-radius: 6px; font-size: 18px; font-weight: bold; box-shadow: 2px 2px 5px rgba(0,0,0,0.5);">💰 {last_price}</div>
+        <div style="background-color: {action_bg}; color: white; padding: 12px 25px; border-radius: 6px; font-size: 18px; font-weight: bold; box-shadow: 2px 2px 5px rgba(0,0,0,0.5);">⚡ {last_action}</div>
+    </div>
+    """
+    st.markdown(banner_html, unsafe_allow_html=True)
+
+    # 5. 刪除「區域一：左側網格建倉軌跡」標題
+    plot_df = result_df.tail(plot_days) if plot_days > 0 else result_df
+    
+    fig = go.Figure()
+    
+    # 持倉區間底色 (透明橘色)
+    in_position = False
+    start_dt = None
+    for date, row in plot_df.iterrows():
+        if row['Position'] > 0 and not in_position:
+            start_dt = date
+            in_position = True
+        elif row['Position'] == 0 and in_position:
+            fig.add_vrect(x0=start_dt, x1=date, fillcolor="rgba(255, 165, 0, 0.15)", layer="below", line_width=0)
+            in_position = False
+    if in_position:
+        fig.add_vrect(x0=start_dt, x1=plot_df.index[-1], fillcolor="rgba(255, 165, 0, 0.15)", layer="below", line_width=0)
+
+    # 7. K線改為台股習慣 (紅漲、綠跌)，移除布林下軌和20日線
+    fig.add_trace(go.Candlestick(
+        x=plot_df.index, open=plot_df['Open'], high=plot_df['High'], low=plot_df['Low'], close=plot_df['Close'], 
+        name='K線',
+        increasing_line_color='#ef5350', decreasing_line_color='#26a69a'
+    ))
+    
+    # 7. 買賣訊號垂直線標記
+    buys = plot_df[plot_df['Position_Shift'] > 0]
+    sells = plot_df[plot_df['Position_Shift'] < 0]
+    
+    for dt in buys.index:
+        fig.add_vline(x=dt, line_dash="dash", line_color="#FFD700", opacity=0.8, line_width=2) # 黃色虛線
+    for dt in sells.index:
+        fig.add_vline(x=dt, line_dash="solid", line_color="#1E90FF", opacity=0.8, line_width=2) # 藍色實線
+    
+    # 6. 刪除圖表上的標題
+    fig.update_layout(title="", xaxis_title="日期", yaxis_title="價格", height=600, xaxis_rangeslider_visible=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ==========================================
+    # 進出場紀錄 (過去30筆)
+    # ==========================================
+    # 8. 刪除區域二標題，改為精簡的進出場紀錄
+    st.markdown("<h4 style='text-align: left; margin-top: 20px;'>近期交易紀錄</h4>", unsafe_allow_html=True)
+    
+    action_only_df = result_df[result_df['Position_Shift'] != 0].copy()
+    recent_actions = action_only_df.tail(30)
+    
+    if recent_actions.empty:
+        st.info("近 30 個交易日內無任何進出場動作。")
+    else:
+        # 將紀錄反轉，讓最新的排在最上面
+        recent_actions = recent_actions.iloc[::-1]
+        for idx, row in recent_actions.iterrows():
+            d_str = idx.strftime('%Y-%m-%d')
+            p_str = f"{row['Close']:.2f}"
+            a_str = row['Action']
             
-            error_msgs = []
-            if df_target.empty: error_msgs.append(f"缺失 {ticker} 資料")
-            if df_taiex.empty: error_msgs.append("缺失 TAIEX 資料")
-            
-            if not error_msgs:
-                result_df = run_left_side_strategy(df_target, df_taiex, df_futures)
-                
-                # ==========================================
-                # [第一區] 戰略全貌：價格行為與網格觸發圖
-                # ==========================================
-                st.header("區域一：左側網格建倉軌跡")
-                plot_df = result_df.tail(plot_days) if plot_days > 0 else result_df
-                
-                fig = go.Figure()
-                
-                # 繪製持倉區間底色 (依據部位大小給予不同透明度)
-                in_position = False
-                start_date = None
-                for date, row in plot_df.iterrows():
-                    if row['Position'] > 0 and not in_position:
-                        start_date = date
-                        in_position = True
-                    elif row['Position'] == 0 and in_position:
-                        fig.add_vrect(x0=start_date, x1=date, fillcolor="rgba(255, 165, 0, 0.15)", layer="below", line_width=0)
-                        in_position = False
-                if in_position:
-                    fig.add_vrect(x0=start_date, x1=plot_df.index[-1], fillcolor="rgba(255, 165, 0, 0.15)", layer="below", line_width=0)
-
-                # K線與布林通道下軌
-                fig.add_trace(go.Candlestick(x=plot_df.index, open=plot_df['Open'], high=plot_df['High'],
-                                             low=plot_df['Low'], close=plot_df['Close'], name='K線'))
-                fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['BB_Lower'], mode='lines', line=dict(color='rgba(0,191,255,0.6)', dash='dot'), name='布林下軌 (接刀線)'))
-                fig.add_trace(go.Scatter(x=plot_df.index, y=plot_df['MA20'], mode='lines', line=dict(color='rgba(255,255,255,0.4)'), name='20日線 (停利線)'))
-                
-                # 買賣標記 (分批網格)
-                buys = plot_df[plot_df['Position_Shift'] > 0]
-                sells = plot_df[plot_df['Position_Shift'] < 0]
-                
-                fig.add_trace(go.Scatter(x=buys.index, y=buys['Low'], mode='markers',
-                                         marker=dict(symbol='triangle-up', size=14, color='orange', line=dict(color='darkred', width=2)), 
-                                         text=buys['Action'], name='向下攤平加碼'))
-                fig.add_trace(go.Scatter(x=sells.index, y=sells['High'], mode='markers',
-                                         marker=dict(symbol='triangle-down', size=16, color='cyan', line=dict(color='blue', width=2)), 
-                                         text=sells['Action'], name='均值回歸停利'))
-                
-                fig.update_layout(title=f"{ticker} 左側逆勢網格圖", xaxis_title="日期", yaxis_title="價格", height=600, xaxis_rangeslider_visible=False)
-                st.plotly_chart(fig, use_container_width=True)
-                
-                st.divider()
-                
-                # ==========================================
-                # [第二區] 執行指令：次日操作監控表
-                # ==========================================
-                st.header("區域二：左側極值監控表")
-                view_df = result_df.tail(15).copy()
-
-                # --- 🚨 核心視覺修復：將指標逆向還原至券商真實報價維度 ---
-                split_date = pd.to_datetime('2026-03-31')
-                split_ratio = 22.0
-                
-                # 若為分割前的歷史日期，將計算出來的還原指標乘回 22 倍，對齊實際報價
-                mask = view_df.index < split_date
-                view_df.loc[mask, 'BB_Lower'] = view_df.loc[mask, 'BB_Lower'] * split_ratio
-                view_df.loc[mask, 'MA20'] = view_df.loc[mask, 'MA20'] * split_ratio
-
-                view_df.index = view_df.index.strftime('%Y-%m-%d')
-                view_df.index.name = '日期'
-
-                # 價差狀態文字轉換
-                def map_basis_ui(state):
-                    if state == "極端正價差": return "⚠️ 情緒過熱"
-                    elif state == "微幅正價差": return "🔥 軋空起手"
-                    elif state == "實質逆價差": return "🛡️ 轉倉紅利"
-                    elif state == "假性逆價差": return "❄️ 除息干擾"
-                    else: return "⚖️ 價差平水"
-                view_df['籌碼觀測'] = view_df['Basis_State'].apply(map_basis_ui)
-
-                # --- UI 優化 1：RSI 直觀顯示 ---
-                def format_rsi(r):
-                    if pd.isna(r): return "-"
-                    if r < 20: return f"🩸 {r:.1f} (極恐慌)"
-                    elif r < 32: return f"⚠️ {r:.1f} (超賣)"
-                    elif r > 70: return f"🔥 {r:.1f} (過熱)"
-                    else: return f" {r:.1f} (平靜)"
-                view_df['RSI(恐慌度)'] = view_df['RSI'].apply(format_rsi)
-
-                # --- UI 優化 2：負乖離率格式化 ---
-                view_df['負乖離率'] = view_df['BIAS'].apply(lambda x: f"{x:.2f}%" if pd.notna(x) else "-")
-
-                # --- UI 優化 3：所有價格統一對齊小數點後 2 位 ---
-                view_df['Close'] = view_df['Close'].apply(lambda x: f"{x:.2f}")
-                view_df['BB_Lower'] = view_df['BB_Lower'].apply(lambda x: f"{x:.2f}")
-                view_df['MA20'] = view_df['MA20'].apply(lambda x: f"{x:.2f}")
-
-                # 篩選欄位與重命名
-                display_cols = ['Close', 'RSI(恐慌度)', '負乖離率', 'BB_Lower', 'MA20', '籌碼觀測', 'Position', 'Action']
-                view_df = view_df[display_cols]
-                view_df = view_df.rename(columns={
-                    'Close': '券商實際報價', 
-                    'BB_Lower': '布林下軌(接刀點)', 
-                    'MA20': '月均線(停利點)', 
-                    'Position': '目標倉位(%)'
-                })
-                
-                view_df['目標倉位(%)'] = (view_df['目標倉位(%)'] * 100).astype(int).astype(str) + "%"
-
-                st.dataframe(view_df.style.map(
-                    lambda x: 'background-color: #ffcccc' if x == "0%" else ('background-color: #ffe4b5' if x != "100%" else 'background-color: #ccffcc'),
-                    subset=['目標倉位(%)']
-                ), use_container_width=True)
-                
-                st.divider()
-
-                # ==========================================
-                # [第三區] 戰略評估：實盤資金權益曲線
-                # ==========================================
-                st.header("區域三：資金績效模擬 (分批網格實戰)")
-                btest_df = calculate_equity_curve(result_df, start_date=bt_start_date, 
-                                                  initial_capital=initial_capital, 
-                                                  fee_rate=fee_rate, tax_rate=tax_rate)
-                
-                if not btest_df.empty:
-                    final_equity = btest_df['Equity'].iloc[-1]
-                    max_dd = btest_df['Drawdown'].min() * 100
-                    total_return = ((final_equity / initial_capital) - 1) * 100
-                    
-                    col1, col2, col3 = st.columns(3)
-                    col1.metric("最終帳戶淨值 (NTD)", f"${final_equity:,.0f}")
-                    col2.metric("區間總報酬率", f"{total_return:.2f}%")
-                    col3.metric("最大歷史回檔 (MDD)", f"{max_dd:.2f}%")
-                    
-                    fig_eq = go.Figure()
-                    fig_eq.add_trace(go.Scatter(x=btest_df.index, y=btest_df['Equity'], mode='lines', name='帳戶總淨值', line=dict(color='gold', width=2)))
-                    
-                    b_points = btest_df[btest_df['Position_Shift'] > 0]
-                    s_points = btest_df[btest_df['Position_Shift'] < 0]
-                    
-                    fig_eq.add_trace(go.Scatter(x=b_points.index, y=b_points['Equity'], mode='markers',
-                                             marker=dict(symbol='triangle-up', size=10, color='orange'), name='向下攤平加碼'))
-                    fig_eq.add_trace(go.Scatter(x=s_points.index, y=s_points['Equity'], mode='markers',
-                                             marker=dict(symbol='triangle-down', size=10, color='cyan'), name='強制停利出局'))
-                    
-                    fig_eq.update_layout(title=f"網格系統權益曲線 (起始本金: {initial_capital:,.0f})", xaxis_title="日期", yaxis_title="淨值 (NTD)", height=400)
-                    st.plotly_chart(fig_eq, use_container_width=True)
+            # 8. 買進綠色三角形朝右，賣出紅色三角形朝左
+            if row['Position_Shift'] > 0:
+                triangle = "<span style='color: #2E7D32; font-size: 1.2em;'>►</span>"
             else:
-                st.error("🚨 核心資料鏈斷裂，策略中止執行。")
-                for msg in error_msgs: st.error(f"-> {msg}")
+                triangle = "<span style='color: #C62828; font-size: 1.2em;'>◄</span>"
+                
+            st.markdown(f"{triangle} &nbsp; **{d_str}** &nbsp;&nbsp;|&nbsp;&nbsp; 收盤價：**{p_str}** &nbsp;&nbsp;|&nbsp;&nbsp; 動作：**{a_str}**", unsafe_allow_html=True)
+
+    # ==========================================
+    # 績效模擬
+    # ==========================================
+    if st.session_state.show_backtest:
+        # 9. 標題與紀錄之間以灰色橫線區分，文字靠左，縮小約30% (使用 h4)
+        st.markdown("<hr style='border: 1px solid #555; margin-top: 30px; margin-bottom: 20px;'>", unsafe_allow_html=True)
+        st.markdown("<h4 style='text-align: left;'>績效模擬</h4>", unsafe_allow_html=True)
+        
+        btest_df = calculate_equity_curve(result_df, start_date=bt_start_date, end_date=bt_end_date,
+                                          initial_capital=initial_capital, fee_rate=fee_rate, tax_rate=tax_rate)
+        
+        if not btest_df.empty:
+            final_equity = btest_df['Equity'].iloc[-1]
+            max_dd = btest_df['Drawdown'].min() * 100
+            total_return = ((final_equity / initial_capital) - 1) * 100
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("最終帳戶淨值 (NTD)", f"${final_equity:,.0f}")
+            col2.metric("區間總報酬率", f"{total_return:.2f}%")
+            col3.metric("最大歷史回檔 (MDD)", f"{max_dd:.2f}%")
+            
+            fig_eq = go.Figure()
+            fig_eq.add_trace(go.Scatter(x=btest_df.index, y=btest_df['Equity'], mode='lines', name='帳戶總淨值', line=dict(color='gold', width=2)))
+            
+            b_points = btest_df[btest_df['Position_Shift'] > 0]
+            s_points = btest_df[btest_df['Position_Shift'] < 0]
+            
+            fig_eq.add_trace(go.Scatter(x=b_points.index, y=b_points['Equity'], mode='markers',
+                                     marker=dict(symbol='triangle-up', size=10, color='orange'), name='向下攤平加碼'))
+            fig_eq.add_trace(go.Scatter(x=s_points.index, y=s_points['Equity'], mode='markers',
+                                     marker=dict(symbol='triangle-down', size=10, color='cyan'), name='強制停利出局'))
+            
+            # 9. 刪除網格系統權益曲線文字，只顯示起始本金
+            fig_eq.update_layout(title=f"起始本金: {initial_capital:,.0f}", xaxis_title="日期", yaxis_title="淨值 (NTD)", height=400)
+            st.plotly_chart(fig_eq, use_container_width=True)
+        else:
+            st.warning("⚠️ 該回測區間內無有效交易資料，請調整左側的回測日期區間。")
