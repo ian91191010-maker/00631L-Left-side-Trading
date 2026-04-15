@@ -19,7 +19,6 @@ except:
     finmind_token = ""  
 
 st.sidebar.subheader("資料源設定")
-# 1. 回測時間預設為0.5年(6個月)，最長為5年
 lookback_years = st.sidebar.number_input("回測時間 (年)", min_value=0.5, max_value=5.0, value=0.5, step=0.5)
 plot_days = st.sidebar.slider("圖表顯示天數 (0為顯示全部)", 0, 1500, 0, step=50)
 
@@ -299,17 +298,32 @@ if not st.session_state.result_df.empty:
     latest_row = result_df.iloc[-1]
     last_date = latest_row.name.strftime('%Y-%m-%d')
     last_price = f"{latest_row['Close']:.2f}"
-    last_action = latest_row['Action'] if latest_row['Action'] else "HOLD (持有/空手)"
     
-    action_bg = "#454545" 
-    if "BUY" in last_action: action_bg = "#2E7D32"  
-    elif "SELL" in last_action: action_bg = "#C62828" 
+    # 1. 判斷精確的 Action 狀態 (加入判斷持有或空手)
+    if latest_row['Action']:
+        last_action = latest_row['Action']
+    else:
+        if latest_row['Position'] > 0:
+            last_action = "HOLD (持有)"
+        else:
+            last_action = "EMPTY (空手)"
     
+    # 2. 依據 Action 判定整體橫幅底色 (透明綠/紅/黃)
+    if "BUY" in last_action or "HOLD" in last_action: 
+        box_bg = "rgba(46, 125, 50, 0.5)"  # 透明綠色
+    elif "SELL" in last_action: 
+        box_bg = "rgba(198, 40, 40, 0.5)"  # 透明紅色
+    elif "EMPTY" in last_action or "空手" in last_action: 
+        box_bg = "rgba(249, 168, 37, 0.5)" # 透明黃色
+    else:
+        box_bg = "rgba(69, 69, 69, 0.5)"   # 預設透明灰
+    
+    # 3. 移除圖示，並將字體放大一倍 (設定為 36px)
     banner_html = f"""
     <div style="display: flex; justify-content: center; gap: 15px; margin-bottom: 25px;">
-        <div style="background-color: #454545; color: white; padding: 12px 25px; border-radius: 6px; font-size: 18px; font-weight: bold; box-shadow: 2px 2px 5px rgba(0,0,0,0.5);">📅 {last_date}</div>
-        <div style="background-color: #454545; color: white; padding: 12px 25px; border-radius: 6px; font-size: 18px; font-weight: bold; box-shadow: 2px 2px 5px rgba(0,0,0,0.5);">💰 {last_price}</div>
-        <div style="background-color: {action_bg}; color: white; padding: 12px 25px; border-radius: 6px; font-size: 18px; font-weight: bold; box-shadow: 2px 2px 5px rgba(0,0,0,0.5);">⚡ {last_action}</div>
+        <div style="background-color: {box_bg}; color: white; padding: 10px 25px; border-radius: 6px; font-size: 36px; font-weight: bold; box-shadow: 2px 2px 5px rgba(0,0,0,0.5);">{last_date}</div>
+        <div style="background-color: {box_bg}; color: white; padding: 10px 25px; border-radius: 6px; font-size: 36px; font-weight: bold; box-shadow: 2px 2px 5px rgba(0,0,0,0.5);">{last_price}</div>
+        <div style="background-color: {box_bg}; color: white; padding: 10px 25px; border-radius: 6px; font-size: 36px; font-weight: bold; box-shadow: 2px 2px 5px rgba(0,0,0,0.5);">{last_action}</div>
     </div>
     """
     st.markdown(banner_html, unsafe_allow_html=True)
@@ -339,7 +353,6 @@ if not st.session_state.result_df.empty:
     buys = plot_df[plot_df['Position_Shift'] > 0]
     sells = plot_df[plot_df['Position_Shift'] < 0]
     
-    # 2. 買賣訊號垂直線：粗細縮為原來的40% (0.8)，賣出改為藍色虛線(dash)
     for dt in buys.index:
         fig.add_vline(x=dt, line_dash="dash", line_color="#FFD700", opacity=0.8, line_width=0.8) 
     for dt in sells.index:
@@ -349,18 +362,17 @@ if not st.session_state.result_df.empty:
     st.plotly_chart(fig, use_container_width=True)
 
     # ==========================================
-    # 進出場紀錄 (過去30個交易日)
+    # 進出場紀錄 (最近3次)
     # ==========================================
-    st.markdown("<h4 style='text-align: left; margin-top: 20px;'>近期交易紀錄 (近30個交易日)</h4>", unsafe_allow_html=True)
+    st.markdown("<h4 style='text-align: left; margin-top: 20px;'>近期交易紀錄 (最近3次)</h4>", unsafe_allow_html=True)
     
-    # 3. 邏輯修正：先取最近的 30 個「交易日」，再從裡面挑出有交易動作的日子
-    recent_30_days_df = result_df.tail(30)
-    recent_actions = recent_30_days_df[recent_30_days_df['Position_Shift'] != 0].copy()
+    # 4. 取得所有有動作的紀錄，並只保留最後 3 筆
+    recent_actions = result_df[result_df['Position_Shift'] != 0].tail(3).copy()
     
     if recent_actions.empty:
-        st.info("近 30 個交易日內無任何進出場動作。")
+        st.info("目前無任何進出場動作。")
     else:
-        recent_actions = recent_actions.iloc[::-1]
+        recent_actions = recent_actions.iloc[::-1] # 反轉讓最新的一筆在最上方
         for idx, row in recent_actions.iterrows():
             d_str = idx.strftime('%Y-%m-%d')
             p_str = f"{row['Close']:.2f}"
