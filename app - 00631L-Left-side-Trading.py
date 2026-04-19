@@ -18,30 +18,35 @@ try:
 except:
     finmind_token = ""  
 
-st.sidebar.subheader("資料源設定")
-lookback_years = st.sidebar.number_input("回測時間 (年)", min_value=0.5, max_value=5.0, value=0.5, step=0.5)
-plot_days = st.sidebar.slider("圖表顯示天數 (0為顯示全部)", 0, 1500, 0, step=50)
+# ==========================================
+# 側邊欄：1. 資料源設定 (決定下載多少資料)
+# ==========================================
+st.sidebar.subheader("1. 資料下載設定")
+# 設定資料下載的起點，預設為 2014 年
+data_default_start = datetime.strptime('2014-01-01', '%Y-%m-%d').date()
+data_start_date = st.sidebar.date_input("資料下載起始日", data_default_start, 
+                                        min_value=datetime.strptime('2010-01-01', '%Y-%m-%d').date(),
+                                        help="建議比回測開始日早 3-6 個月，以利技術指標計算")
 
+plot_days = st.sidebar.slider("圖表顯示天數 (0為顯示全部)", 0, 1500, 0, step=50)
 btn_run_strategy = st.sidebar.button("▶️ 執行策略運算")
 
-ticker = "00631L"
-
 st.sidebar.markdown("---")
-st.sidebar.subheader("資金回測與摩擦成本設定")
 
-default_start = datetime.strptime('2024-01-01', '%Y-%m-%d').date()
-default_end = datetime.today().date()
+# ==========================================
+# 側邊欄：2. 資金回測設定 (決定模擬哪段區間)
+# ==========================================
+st.sidebar.subheader("2. 資金回測與成本設定")
 
-# 將起訖日期拆分為兩個獨立欄位並排顯示
-col1, col2 = st.sidebar.columns(2)
-with col1:
-    bt_start_date = st.date_input("回測開始日期", default_start)
-with col2:
-    bt_end_date = st.date_input("回測結束日期", default_end)
-    
-# 確保結束日期不會早於開始日期
-if bt_end_date < bt_start_date:
-    st.sidebar.warning("⚠️ 結束日期不能早於開始日期，請重新調整！")
+default_bt_start = datetime.strptime('2024-01-01', '%Y-%m-%d').date()
+default_bt_end = datetime.today().date()
+
+# 將起訖日期拆分為兩個獨立欄位
+col_bt1, col_bt2 = st.sidebar.columns(2)
+with col_bt1:
+    bt_start_date = st.date_input("回測開始日", default_bt_start)
+with col_bt2:
+    bt_end_date = st.date_input("回測結束日", default_bt_end)
 
 initial_capital = st.sidebar.number_input("起始投入資金 (NTD)", min_value=10000, value=100000, step=10000)
 fee_rate = st.sidebar.number_input("券商單邊手續費率 (%)", value=0.1425, format="%.4f") / 100
@@ -58,42 +63,29 @@ if "show_backtest" not in st.session_state:
 # 資料獲取模組 
 # ==========================================
 @st.cache_data(show_spinner=False)
-def fetch_stock_data(symbol, years, token):
+def fetch_futures_data(start_date_obj, token): # 參數改為 start_date_obj
     if not token: return pd.DataFrame()
     end_date = datetime.today().strftime('%Y-%m-%d')
-    start_date = (datetime.today() - timedelta(days=years * 365)).strftime('%Y-%m-%d')
+    start_date = start_date_obj.strftime('%Y-%m-%d') # 轉為字串
     
     url = "https://api.finmindtrade.com/api/v4/data"
-    parameter = {"dataset": "TaiwanStockPrice", "data_id": symbol, "start_date": start_date, "end_date": end_date, "token": token}
+    parameter = {"dataset": "TaiwanFuturesDaily", "data_id": "TX", "start_date": start_date, "end_date": end_date, "token": token}
+    
     try:
         res = requests.get(url, params=parameter, timeout=15)
         if res.status_code != 200: return pd.DataFrame()
-        json_data = res.json()
-        if json_data.get("msg") != "success": return pd.DataFrame()
-        df = pd.DataFrame(json_data.get("data", []))
+        df = pd.DataFrame(res.json().get("data", []))
         if df.empty: return df
-            
-        df = df.rename(columns={"date": "Date", "open": "Open", "max": "High", "min": "Low", "close": "Close"})
+        
+        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+        df = df.sort_values(['date', 'volume'], ascending=[True, False])
+        df = df.drop_duplicates(subset=['date'], keep='first') 
+        
+        df = df.rename(columns={"date": "Date", "close": "Futures_Close"})
         df['Date'] = pd.to_datetime(df['Date'])
         df.set_index('Date', inplace=True)
-        for col in ['Open', 'High', 'Low', 'Close']: df[col] = pd.to_numeric(df[col], errors='coerce')
-        df = df.dropna(subset=['Close'])
-        
-        df['Adj_Open'] = df['Open']
-        df['Adj_High'] = df['High']
-        df['Adj_Low'] = df['Low']
-        df['Adj_Close'] = df['Close']
-        
-        split_date = pd.to_datetime('2026-03-31') 
-        split_ratio = 22.0
-        mask = df.index < split_date
-        
-        df.loc[mask, 'Adj_Open'] = df.loc[mask, 'Open'] / split_ratio
-        df.loc[mask, 'Adj_High'] = df.loc[mask, 'High'] / split_ratio
-        df.loc[mask, 'Adj_Low'] = df.loc[mask, 'Low'] / split_ratio
-        df.loc[mask, 'Adj_Close'] = df.loc[mask, 'Close'] / split_ratio
-            
-        return df
+        df['Futures_Close'] = pd.to_numeric(df['Futures_Close'], errors='coerce')
+        return df[['Futures_Close']]
     except:
         return pd.DataFrame()
 
@@ -128,10 +120,10 @@ def fetch_futures_data(years, token):
 # 核心策略模組
 # ==========================================
 @st.cache_data(show_spinner=False)
-def get_strategy_results(ticker, lookback_years, token):
-    df_target = fetch_stock_data(ticker, lookback_years, token)
-    df_taiex = fetch_stock_data("TAIEX", lookback_years, token)
-    df_futures = fetch_futures_data(lookback_years, token)
+def get_strategy_results(ticker, data_start_date, token): # 參數名同步修改
+    df_target = fetch_stock_data(ticker, data_start_date, token)
+    df_taiex = fetch_stock_data("TAIEX", data_start_date, token)
+    df_futures = fetch_futures_data(data_start_date, token)
     
     if df_target.empty or df_taiex.empty:
         return pd.DataFrame()
@@ -301,18 +293,22 @@ def calculate_equity_curve(df, start_date, end_date, initial_capital, fee_rate, 
 # ==========================================
 # 按鈕觸發邏輯與圖表渲染
 # ==========================================
+ticker = "00631L" # 定義目標 ETF 代號
+
 if btn_run_strategy:
     if not finmind_token:
         st.error("🚨 尚未在 secrets.toml 設定 FinMind API Token。")
     else:
         with st.spinner('正在獲取資料並運算策略...'):
-            st.session_state.result_df = get_strategy_results(ticker, lookback_years, finmind_token)
+            # 將 lookback_years 改為 data_start_date
+            st.session_state.result_df = get_strategy_results(ticker, data_start_date, finmind_token) 
             st.session_state.show_backtest = False
 
 if btn_run_backtest:
     if st.session_state.result_df.empty:
         with st.spinner('正在獲取底層資料...'):
-            st.session_state.result_df = get_strategy_results(ticker, lookback_years, finmind_token)
+            # 將 lookback_years 改為 data_start_date
+            st.session_state.result_df = get_strategy_results(ticker, data_start_date, finmind_token)
     st.session_state.show_backtest = True
 
 if not st.session_state.result_df.empty:
