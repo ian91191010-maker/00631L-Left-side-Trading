@@ -63,13 +63,13 @@ if "show_backtest" not in st.session_state:
 # 資料獲取模組 
 # ==========================================
 @st.cache_data(show_spinner=False)
-def fetch_futures_data(start_date_obj, token): # 參數改為 start_date_obj
+def fetch_stock_data(symbol, start_date_obj, token):
     if not token: return pd.DataFrame()
     end_date = datetime.today().strftime('%Y-%m-%d')
     start_date = start_date_obj.strftime('%Y-%m-%d') # 轉為字串
     
     url = "https://api.finmindtrade.com/api/v4/data"
-    parameter = {"dataset": "TaiwanFuturesDaily", "data_id": "TX", "start_date": start_date, "end_date": end_date, "token": token}
+    parameter = {"dataset": "TaiwanStockPrice", "data_id": symbol, "start_date": start_date, "end_date": end_date, "token": token}
     
     try:
         res = requests.get(url, params=parameter, timeout=15)
@@ -77,23 +77,25 @@ def fetch_futures_data(start_date_obj, token): # 參數改為 start_date_obj
         df = pd.DataFrame(res.json().get("data", []))
         if df.empty: return df
         
-        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-        df = df.sort_values(['date', 'volume'], ascending=[True, False])
-        df = df.drop_duplicates(subset=['date'], keep='first') 
-        
-        df = df.rename(columns={"date": "Date", "close": "Futures_Close"})
+        # 重新命名欄位以符合後續計算邏輯
+        df = df.rename(columns={"date": "Date", "open": "Open", "max": "High", "min": "Low", "close": "Close", "Trading_Volume": "Volume"})
         df['Date'] = pd.to_datetime(df['Date'])
         df.set_index('Date', inplace=True)
-        df['Futures_Close'] = pd.to_numeric(df['Futures_Close'], errors='coerce')
-        return df[['Futures_Close']]
+        
+        # 建立 Adj_Open 與 Adj_Close (此處先以原始收盤價代替，若有還原權息資料可再擴充)
+        df['Adj_Open'] = pd.to_numeric(df['Open'], errors='coerce')
+        df['Adj_Close'] = pd.to_numeric(df['Close'], errors='coerce')
+        
+        return df[['Open', 'High', 'Low', 'Close', 'Volume', 'Adj_Open', 'Adj_Close']]
     except:
         return pd.DataFrame()
 
+
 @st.cache_data(show_spinner=False)
-def fetch_futures_data(years, token):
+def fetch_futures_data(start_date_obj, token): 
     if not token: return pd.DataFrame()
     end_date = datetime.today().strftime('%Y-%m-%d')
-    start_date = (datetime.today() - timedelta(days=years * 365)).strftime('%Y-%m-%d')
+    start_date = start_date_obj.strftime('%Y-%m-%d') # 轉為字串
     
     url = "https://api.finmindtrade.com/api/v4/data"
     parameter = {"dataset": "TaiwanFuturesDaily", "data_id": "TX", "start_date": start_date, "end_date": end_date, "token": token}
