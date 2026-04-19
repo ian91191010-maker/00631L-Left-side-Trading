@@ -31,12 +31,17 @@ st.sidebar.subheader("資金回測與摩擦成本設定")
 
 default_start = datetime.strptime('2024-01-01', '%Y-%m-%d').date()
 default_end = datetime.today().date()
-bt_dates = st.sidebar.date_input("回測區間", [default_start, default_end])
 
-if len(bt_dates) == 2:
-    bt_start_date, bt_end_date = bt_dates
-else:
-    bt_start_date, bt_end_date = bt_dates[0], bt_dates[0]
+# 將起訖日期拆分為兩個獨立欄位並排顯示
+col1, col2 = st.sidebar.columns(2)
+with col1:
+    bt_start_date = st.date_input("回測開始日期", default_start)
+with col2:
+    bt_end_date = st.date_input("回測結束日期", default_end)
+    
+# 確保結束日期不會早於開始日期
+if bt_end_date < bt_start_date:
+    st.sidebar.warning("⚠️ 結束日期不能早於開始日期，請重新調整！")
 
 initial_capital = st.sidebar.number_input("起始投入資金 (NTD)", min_value=10000, value=100000, step=10000)
 fee_rate = st.sidebar.number_input("券商單邊手續費率 (%)", value=0.1425, format="%.4f") / 100
@@ -226,7 +231,11 @@ def get_strategy_results(ticker, lookback_years, token):
 # 資金回測模組 
 # ==========================================
 def calculate_equity_curve(df, start_date, end_date, initial_capital, fee_rate, tax_rate):
-    mask = (df.index >= pd.to_datetime(start_date)) & (df.index <= pd.to_datetime(end_date))
+    start_dt = pd.to_datetime(start_date)
+    end_dt = pd.to_datetime(end_date)
+    
+    # 裁切回測區間
+    mask = (df.index >= start_dt) & (df.index <= end_dt)
     if not mask.any(): return pd.DataFrame()
     
     btest_df = df.loc[mask].copy()
@@ -234,40 +243,54 @@ def calculate_equity_curve(df, start_date, end_date, initial_capital, fee_rate, 
     shares = 0
     equity = []
     
+    # 紀錄當下持有的曝險比例
+    current_exposure = 0.0
+    
     for i in range(len(btest_df)):
         today_open = btest_df['Adj_Open'].iloc[i]
         today_close = btest_df['Adj_Close'].iloc[i]
+        current_date = btest_df.index[i]
         
-        if i > 0:
-            target_exposure = btest_df['Position'].iloc[i-1]
-            current_exposure = btest_df['Position'].iloc[i-2] if i > 1 else 0.0
-            shift = target_exposure - current_exposure
+        # 取得「前一天」的目標部位：從完整的 df 中尋找絕對位置
+        idx_in_df = df.index.get_loc(current_date)
+        if idx_in_df > 0:
+            target_exposure = df['Position'].iloc[idx_in_df - 1]
+        else:
+            target_exposure = 0.0
             
-            if shift > 0 and cash > 0:
-                current_equity = cash + (shares * today_open)
-                target_buy_value = current_equity * shift
-                max_buy_value = min(target_buy_value, cash)
-                add_shares = np.floor(max_buy_value / (today_open * (1 + fee_rate)))
+        # 計算應調整的部位差額
+        shift = target_exposure - current_exposure
+        
+        # 執行買進邏輯 (當 shift > 0 且有剩餘資金)
+        if shift > 0 and cash > 0:
+            current_equity = cash + (shares * today_open)
+            target_buy_value = current_equity * shift
+            max_buy_value = min(target_buy_value, cash)
+            add_shares = np.floor(max_buy_value / (today_open * (1 + fee_rate)))
+            
+            if add_shares > 0:
+                cost = add_shares * today_open
+                fee = cost * fee_rate
+                cash = cash - cost - fee
+                shares += add_shares
                 
-                if add_shares > 0:
-                    cost = add_shares * today_open
-                    fee = cost * fee_rate
-                    cash = cash - cost - fee
-                    shares += add_shares
-                    
-            elif shift < 0 and shares > 0:
-                if target_exposure == 0: sell_shares = shares 
-                else:
-                    proportion_to_sell = abs(shift) / current_exposure
-                    sell_shares = np.floor(shares * proportion_to_sell)
-                    
-                if sell_shares > 0:
-                    gross_proceeds = sell_shares * today_open
-                    fee = gross_proceeds * fee_rate
-                    tax = gross_proceeds * tax_rate
-                    cash = cash + gross_proceeds - fee - tax
-                    shares -= sell_shares
-                    
+        # 執行賣出邏輯 (當 shift < 0 且持有股數)
+        elif shift < 0 and shares > 0:
+            if target_exposure == 0: 
+                sell_shares = shares # 全部賣出
+            else:
+                proportion_to_sell = abs(shift) / current_exposure
+                sell_shares = np.floor(shares * proportion_to_sell) # 依比例賣出
+                
+            if sell_shares > 0:
+                gross_proceeds = sell_shares * today_open
+                fee = gross_proceeds * fee_rate
+                tax = gross_proceeds * tax_rate
+                cash = cash + gross_proceeds - fee - tax
+                shares -= sell_shares
+        
+        # 更新當前持有的曝險水位，並記錄今日收盤後的總淨值
+        current_exposure = target_exposure
         current_value = cash + (shares * today_close)
         equity.append(current_value)
         
