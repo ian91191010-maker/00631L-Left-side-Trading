@@ -62,7 +62,7 @@ if "show_backtest" not in st.session_state:
 # ==========================================
 # 資料獲取模組 
 # ==========================================
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=7200)
 def fetch_stock_data(symbol, start_date_obj, token):
     if not token: return pd.DataFrame()
     end_date = datetime.today().strftime('%Y-%m-%d')
@@ -91,8 +91,8 @@ def fetch_stock_data(symbol, start_date_obj, token):
         return pd.DataFrame()
 
 
-@st.cache_data(show_spinner=False)
-def fetch_futures_data(start_date_obj, token): 
+@st.cache_data(show_spinner=False, ttl=7200)
+def fetch_futures_data(start_date_obj, token):
     if not token: return pd.DataFrame()
     end_date = datetime.today().strftime('%Y-%m-%d')
     start_date = start_date_obj.strftime('%Y-%m-%d') # 轉為字串
@@ -121,8 +121,8 @@ def fetch_futures_data(start_date_obj, token):
 # ==========================================
 # 核心策略模組
 # ==========================================
-@st.cache_data(show_spinner=False)
-def get_strategy_results(ticker, data_start_date, token): # 參數名同步修改
+@st.cache_data(show_spinner=False, ttl=7200)
+def get_strategy_results(ticker, data_start_date, token):
     df_target = fetch_stock_data(ticker, data_start_date, token)
     df_taiex = fetch_stock_data("TAIEX", data_start_date, token)
     df_futures = fetch_futures_data(data_start_date, token)
