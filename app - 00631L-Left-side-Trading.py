@@ -19,16 +19,32 @@ except:
     finmind_token = ""  
 
 # ==========================================
-# 側邊欄：1. 資金回測與成本設定 (先設定審計日期)
+# 側邊欄：1. 資料源設定 (決定下載多少資料)
 # ==========================================
-st.sidebar.subheader("1. 資金回測與成本設定")
+st.sidebar.subheader("1. 資料下載設定")
+# 設定資料下載的起點，預設為 2014 年
+data_default_start = datetime.strptime('2014-01-01', '%Y-%m-%d').date()
+data_start_date = st.sidebar.date_input("資料下載起始日", data_default_start, 
+                                        min_value=datetime.strptime('2010-01-01', '%Y-%m-%d').date(),
+                                        help="建議比回測開始日早 3-6 個月，以利技術指標計算")
+
+plot_days = st.sidebar.slider("圖表顯示天數 (0為顯示全部)", 0, 1500, 0, step=50)
+btn_run_strategy = st.sidebar.button("▶️ 執行策略運算")
+
+st.sidebar.markdown("---")
+
+# ==========================================
+# 側邊欄：2. 資金回測設定 (決定模擬哪段區間)
+# ==========================================
+st.sidebar.subheader("2. 資金回測與成本設定")
 
 default_bt_start = datetime.strptime('2024-01-01', '%Y-%m-%d').date()
 default_bt_end = datetime.today().date()
 
+# 將起訖日期拆分為兩個獨立欄位
 col_bt1, col_bt2 = st.sidebar.columns(2)
 with col_bt1:
-    bt_start_date = st.date_input("回測開始日 (審計日期)", default_bt_start)
+    bt_start_date = st.date_input("回測開始日", default_bt_start)
 with col_bt2:
     bt_end_date = st.date_input("回測結束日", default_bt_end)
 
@@ -37,22 +53,6 @@ fee_rate = st.sidebar.number_input("券商單邊手續費率 (%)", value=0.1425,
 tax_rate = st.sidebar.number_input("ETF 賣出交易稅率 (%)", value=0.1, format="%.3f") / 100
 
 btn_run_backtest = st.sidebar.button("📊 執行資金回測")
-
-st.sidebar.markdown("---")
-
-# ==========================================
-# 側邊欄：2. 資料下載設定 (依據審計日期往前推算)
-# ==========================================
-st.sidebar.subheader("2. 資料下載設定")
-
-# 預設為審計日期前 120 個交易日 (約 170 個日曆日)
-default_data_start = bt_start_date - timedelta(days=170)
-data_start_date = st.sidebar.date_input("資料下載起始日", default_data_start, 
-                                        help="預設為審計日期前120個交易日，以利技術指標計算")
-
-# 預設顯示 50 天，維持可調整的拉桿
-plot_days = st.sidebar.slider("圖表顯示天數 (0為顯示全部)", 0, 1500, 50, step=50)
-btn_run_strategy = st.sidebar.button("▶️ 執行策略運算")
 
 if "result_df" not in st.session_state:
     st.session_state.result_df = pd.DataFrame()
@@ -66,71 +66,36 @@ if "show_backtest" not in st.session_state:
 def fetch_stock_data(symbol, start_date_obj, token):
     if not token: return pd.DataFrame()
     end_date = datetime.today().strftime('%Y-%m-%d')
-    start_date = start_date_obj.strftime('%Y-%m-%d') 
+    start_date = start_date_obj.strftime('%Y-%m-%d') # 轉為字串
     
     url = "https://api.finmindtrade.com/api/v4/data"
+    parameter = {"dataset": "TaiwanStockPrice", "data_id": symbol, "start_date": start_date, "end_date": end_date, "token": token}
     
     try:
-        # 1. 取得原始股價
-        param_raw = {"dataset": "TaiwanStockPrice", "data_id": symbol, "start_date": start_date, "end_date": end_date, "token": token}
-        res_raw = requests.get(url, params=param_raw, timeout=15)
-        if res_raw.status_code != 200: return pd.DataFrame()
+        res = requests.get(url, params=parameter, timeout=15)
+        if res.status_code != 200: return pd.DataFrame()
+        df = pd.DataFrame(res.json().get("data", []))
+        if df.empty: return df
         
-        data_raw = res_raw.json().get("data", [])
-        if not data_raw: return pd.DataFrame()
-        
-        df = pd.DataFrame(data_raw)
+        # 重新命名欄位以符合後續計算邏輯
         df = df.rename(columns={"date": "Date", "open": "Open", "max": "High", "min": "Low", "close": "Close", "Trading_Volume": "Volume"})
         df['Date'] = pd.to_datetime(df['Date'])
         df.set_index('Date', inplace=True)
         
-        for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
-            
-        df = df[['Open', 'High', 'Low', 'Close', 'Volume']]
+        # 建立 Adj_Open 與 Adj_Close (此處先以原始收盤價代替，若有還原權息資料可再擴充)
+        df['Adj_Open'] = pd.to_numeric(df['Open'], errors='coerce')
+        df['Adj_Close'] = pd.to_numeric(df['Close'], errors='coerce')
         
-        # 2. 取得還原股價 (只取 Close 來計算比例，避免 FinMind 缺漏 Open/High/Low)
-        param_adj = {"dataset": "TaiwanStockPriceAdj", "data_id": symbol, "start_date": start_date, "end_date": end_date, "token": token}
-        res_adj = requests.get(url, params=param_adj, timeout=15)
-        
-        has_adj = False
-        if res_adj.status_code == 200:
-            data_adj = res_adj.json().get("data", [])
-            if data_adj:
-                df_adj = pd.DataFrame(data_adj)
-                df_adj = df_adj.rename(columns={"date": "Date", "close": "Adj_Close_Raw"})
-                df_adj['Date'] = pd.to_datetime(df_adj['Date'])
-                df_adj.set_index('Date', inplace=True)
-                df_adj['Adj_Close_Raw'] = pd.to_numeric(df_adj['Adj_Close_Raw'], errors='coerce')
-                
-                df = df.join(df_adj[['Adj_Close_Raw']], how='left')
-                has_adj = True
-                
-        # 3. 比例還原法計算開高低收
-        if not has_adj:
-            # 完全沒有還原資料
-            df['Adj_Close'] = df['Close']
-            df['Has_Adj'] = False
-        else:
-            # 填補缺失的還原收盤價 (若有遺漏則用原始收盤價代替)
-            df['Adj_Close'] = df['Adj_Close_Raw'].fillna(df['Close'])
-            df['Has_Adj'] = True
-            
-        # 核心：透過收盤價比例，完美推算回開盤、最高、最低，保證 K 線平滑
-        df['Adj_Ratio'] = df['Adj_Close'] / df['Close']
-        df['Adj_Open'] = df['Open'] * df['Adj_Ratio']
-        df['Adj_High'] = df['High'] * df['Adj_Ratio']
-        df['Adj_Low'] = df['Low'] * df['Adj_Ratio']
-            
-        return df
-    except Exception as e:
+        return df[['Open', 'High', 'Low', 'Close', 'Volume', 'Adj_Open', 'Adj_Close']]
+    except:
         return pd.DataFrame()
+
 
 @st.cache_data(show_spinner=False, ttl=7200)
 def fetch_futures_data(start_date_obj, token):
     if not token: return pd.DataFrame()
     end_date = datetime.today().strftime('%Y-%m-%d')
-    start_date = start_date_obj.strftime('%Y-%m-%d') 
+    start_date = start_date_obj.strftime('%Y-%m-%d') # 轉為字串
     
     url = "https://api.finmindtrade.com/api/v4/data"
     parameter = {"dataset": "TaiwanFuturesDaily", "data_id": "TX", "start_date": start_date, "end_date": end_date, "token": token}
@@ -168,7 +133,6 @@ def get_strategy_results(ticker, data_start_date, token):
     df = df_target.copy()
     df_taiex = df_taiex.reindex(df.index).ffill()
     
-    # 指標計算均使用「還原收盤價(Adj_Close)」
     df['RSI'] = ta.momentum.rsi(df['Adj_Close'], window=14)
     bb = ta.volatility.BollingerBands(df['Adj_Close'], window=20, window_dev=2.2)
     df['BB_Lower'] = bb.bollinger_lband()
@@ -264,6 +228,7 @@ def calculate_equity_curve(df, start_date, end_date, initial_capital, fee_rate, 
     start_dt = pd.to_datetime(start_date)
     end_dt = pd.to_datetime(end_date)
     
+    # 裁切回測區間
     mask = (df.index >= start_dt) & (df.index <= end_dt)
     if not mask.any(): return pd.DataFrame()
     
@@ -272,22 +237,25 @@ def calculate_equity_curve(df, start_date, end_date, initial_capital, fee_rate, 
     shares = 0
     equity = []
     
+    # 紀錄當下持有的曝險比例
     current_exposure = 0.0
     
     for i in range(len(btest_df)):
-        # 回測交易金額依然使用原始股價(貼近真實帳戶)
-        today_open = btest_df['Open'].iloc[i]
-        today_close = btest_df['Close'].iloc[i]
+        today_open = btest_df['Adj_Open'].iloc[i]
+        today_close = btest_df['Adj_Close'].iloc[i]
         current_date = btest_df.index[i]
         
+        # 取得「前一天」的目標部位：從完整的 df 中尋找絕對位置
         idx_in_df = df.index.get_loc(current_date)
         if idx_in_df > 0:
             target_exposure = df['Position'].iloc[idx_in_df - 1]
         else:
             target_exposure = 0.0
             
+        # 計算應調整的部位差額
         shift = target_exposure - current_exposure
         
+        # 執行買進邏輯 (當 shift > 0 且有剩餘資金)
         if shift > 0 and cash > 0:
             current_equity = cash + (shares * today_open)
             target_buy_value = current_equity * shift
@@ -300,12 +268,13 @@ def calculate_equity_curve(df, start_date, end_date, initial_capital, fee_rate, 
                 cash = cash - cost - fee
                 shares += add_shares
                 
+        # 執行賣出邏輯 (當 shift < 0 且持有股數)
         elif shift < 0 and shares > 0:
             if target_exposure == 0: 
-                sell_shares = shares 
+                sell_shares = shares # 全部賣出
             else:
                 proportion_to_sell = abs(shift) / current_exposure
-                sell_shares = np.floor(shares * proportion_to_sell) 
+                sell_shares = np.floor(shares * proportion_to_sell) # 依比例賣出
                 
             if sell_shares > 0:
                 gross_proceeds = sell_shares * today_open
@@ -314,6 +283,7 @@ def calculate_equity_curve(df, start_date, end_date, initial_capital, fee_rate, 
                 cash = cash + gross_proceeds - fee - tax
                 shares -= sell_shares
         
+        # 更新當前持有的曝險水位，並記錄今日收盤後的總淨值
         current_exposure = target_exposure
         current_value = cash + (shares * today_close)
         equity.append(current_value)
@@ -325,33 +295,32 @@ def calculate_equity_curve(df, start_date, end_date, initial_capital, fee_rate, 
 # ==========================================
 # 按鈕觸發邏輯與圖表渲染
 # ==========================================
-ticker = "00631L" 
+ticker = "00631L" # 定義目標 ETF 代號
 
 if btn_run_strategy:
     if not finmind_token:
         st.error("🚨 尚未在 secrets.toml 設定 FinMind API Token。")
     else:
         with st.spinner('正在獲取資料並運算策略...'):
+            # 將 lookback_years 改為 data_start_date
             st.session_state.result_df = get_strategy_results(ticker, data_start_date, finmind_token) 
             st.session_state.show_backtest = False
 
 if btn_run_backtest:
     if st.session_state.result_df.empty:
         with st.spinner('正在獲取底層資料...'):
+            # 將 lookback_years 改為 data_start_date
             st.session_state.result_df = get_strategy_results(ticker, data_start_date, finmind_token)
     st.session_state.show_backtest = True
 
 if not st.session_state.result_df.empty:
     result_df = st.session_state.result_df
 
-    # 如果 FinMind 完全沒有提供該標的的還原資料，提醒使用者
-    if 'Has_Adj' in result_df.columns and not result_df['Has_Adj'].iloc[-1]:
-        st.warning(f"⚠️ FinMind 資料庫目前未提供 {ticker} 的還原股價資料，圖表及運算將以原始股價呈現。")
-
     latest_row = result_df.iloc[-1]
     last_date = latest_row.name.strftime('%Y-%m-%d')
     last_price = f"{latest_row['Close']:.2f}"
     
+    # 1. 判斷精確的 Action 狀態 (加入判斷持有或空手)
     if latest_row['Action']:
         last_action = latest_row['Action']
     else:
@@ -360,15 +329,17 @@ if not st.session_state.result_df.empty:
         else:
             last_action = "EMPTY (空手)"
     
+    # 2. 依據 Action 判定整體橫幅底色 (透明綠/紅/黃)
     if "BUY" in last_action or "HOLD" in last_action: 
-        box_bg = "rgba(46, 125, 50, 0.5)"  
+        box_bg = "rgba(46, 125, 50, 0.5)"  # 透明綠色
     elif "SELL" in last_action: 
-        box_bg = "rgba(198, 40, 40, 0.5)"  
+        box_bg = "rgba(198, 40, 40, 0.5)"  # 透明紅色
     elif "EMPTY" in last_action or "空手" in last_action: 
-        box_bg = "rgba(249, 168, 37, 0.5)" 
+        box_bg = "rgba(249, 168, 37, 0.5)" # 透明黃色
     else:
-        box_bg = "rgba(69, 69, 69, 0.5)"   
+        box_bg = "rgba(69, 69, 69, 0.5)"   # 預設透明灰
     
+    # 3. 移除圖示，並將字體放大一倍 (設定為 36px)
     banner_html = f"""
     <div style="display: flex; justify-content: center; gap: 15px; margin-bottom: 25px;">
         <div style="background-color: {box_bg}; color: white; padding: 10px 25px; border-radius: 6px; font-size: 36px; font-weight: bold; box-shadow: 2px 2px 5px rgba(0,0,0,0.5);">{last_date}</div>
@@ -394,14 +365,9 @@ if not st.session_state.result_df.empty:
     if in_position:
         fig.add_vrect(x0=start_dt, x1=plot_df.index[-1], fillcolor="rgba(255, 165, 0, 0.15)", layer="below", line_width=0)
 
-    # 綁定經過比例精密計算的 Adj_ 系列價格，保證不會斷層
     fig.add_trace(go.Candlestick(
-        x=plot_df.index, 
-        open=plot_df['Adj_Open'], 
-        high=plot_df['Adj_High'], 
-        low=plot_df['Adj_Low'], 
-        close=plot_df['Adj_Close'], 
-        name='還原K線',
+        x=plot_df.index, open=plot_df['Open'], high=plot_df['High'], low=plot_df['Low'], close=plot_df['Close'], 
+        name='K線',
         increasing_line_color='#ef5350', decreasing_line_color='#26a69a'
     ))
     
@@ -413,7 +379,7 @@ if not st.session_state.result_df.empty:
     for dt in sells.index:
         fig.add_vline(x=dt, line_dash="dash", line_color="#1E90FF", opacity=0.8, line_width=0.8) 
     
-    fig.update_layout(title="", xaxis_title="日期", yaxis_title="還原價格", height=600, xaxis_rangeslider_visible=False)
+    fig.update_layout(title="", xaxis_title="日期", yaxis_title="價格", height=600, xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
 
     # ==========================================
@@ -421,12 +387,13 @@ if not st.session_state.result_df.empty:
     # ==========================================
     st.markdown("<h4 style='text-align: left; margin-top: 20px;'>近期交易紀錄 (最近3次)</h4>", unsafe_allow_html=True)
     
+    # 4. 取得所有有動作的紀錄，並只保留最後 3 筆
     recent_actions = result_df[result_df['Position_Shift'] != 0].tail(3).copy()
     
     if recent_actions.empty:
         st.info("目前無任何進出場動作。")
     else:
-        recent_actions = recent_actions.iloc[::-1] 
+        recent_actions = recent_actions.iloc[::-1] # 反轉讓最新的一筆在最上方
         for idx, row in recent_actions.iterrows():
             d_str = idx.strftime('%Y-%m-%d')
             p_str = f"{row['Close']:.2f}"
@@ -437,7 +404,7 @@ if not st.session_state.result_df.empty:
             else:
                 triangle = "<span style='color: #C62828; font-size: 1.2em;'>◄</span>"
                 
-            st.markdown(f"{triangle} &nbsp; **{d_str}** &nbsp;&nbsp;|&nbsp;&nbsp; 原始收盤價：**{p_str}** &nbsp;&nbsp;|&nbsp;&nbsp; 動作：**{a_str}**", unsafe_allow_html=True)
+            st.markdown(f"{triangle} &nbsp; **{d_str}** &nbsp;&nbsp;|&nbsp;&nbsp; 收盤價：**{p_str}** &nbsp;&nbsp;|&nbsp;&nbsp; 動作：**{a_str}**", unsafe_allow_html=True)
 
     # ==========================================
     # 績效模擬
