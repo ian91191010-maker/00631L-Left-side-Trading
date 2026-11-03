@@ -31,8 +31,9 @@ SPLIT_EVENTS = {
     "00631L": [("2026-03-31", 22)],
 }
 
-# 槓桿 ETF 單日漲跌幅上限約 10%，超過 12% 幾乎一定是分割或資料異常
-JUMP_WARN_LIMIT = 0.12
+# 2 倍槓桿 ETF 的單日漲跌幅上限約 20%（大盤 10% × 2），真實行情可以接近 20%。
+# 1 拆 22 這類分割的單日變動約 95%，所以門檻設 30%，只抓分割或資料異常，不會誤報正常大波動。
+JUMP_WARN_LIMIT = 0.30
 
 CHART_RANGES = {
     "近 3 個月": 63,
@@ -278,9 +279,48 @@ def get_strategy_results(ticker, data_start_date, token):
     df["Position"] = positions
     df["Avg_Cost"] = avg_costs
     df["Cooldown"] = cooldowns
+    df["Chg_Pct"] = df["Close"].pct_change() * 100
     df["Position_Shift"] = df["Position"].diff().fillna(0)
     df["Action"] = [map_action(s, p) for s, p in zip(df["Position_Shift"], df["Position"])]
     return df, notes
+
+
+def build_trades(df):
+    """把部位序列整理成「一次完整進出場」的交易循環（空手 → 持有 → 回到空手）。
+
+    漲跌幅 = 出場收盤價 ÷ 出場前的加權均價 − 1（以訊號日收盤價計算，未計手續費與交易稅）。
+    尚未出場的交易以最新收盤價計算未實現漲跌幅。
+    """
+    pos = df["Position"].to_numpy()
+    avg = df["Avg_Cost"].to_numpy()
+    close = df["Close"].to_numpy()
+    cooldown = df["Cooldown"].to_numpy()
+    idx = df.index
+
+    rows = []
+    entry_i = None
+    for i in range(1, len(df)):
+        if pos[i - 1] == 0 and pos[i] > 0:
+            entry_i = i
+        elif pos[i - 1] > 0 and pos[i] == 0 and entry_i is not None:
+            cost = avg[i - 1]
+            rows.append({
+                "entry_date": idx[entry_i], "exit_date": idx[i], "days": i - entry_i,
+                "max_pos": pos[entry_i:i].max(), "avg_cost": cost, "exit_price": close[i],
+                "ret": (close[i] / cost - 1) * 100,
+                "reason": "停損" if cooldown[i] else "訊號出場", "is_open": False,
+            })
+            entry_i = None
+    if entry_i is not None:
+        cost = avg[-1]
+        rows.append({
+            "entry_date": idx[entry_i], "exit_date": pd.NaT, "days": len(df) - 1 - entry_i,
+            "max_pos": pos[entry_i:].max(), "avg_cost": cost, "exit_price": close[-1],
+            "ret": (close[-1] / cost - 1) * 100 if cost > 0 else np.nan,
+            "reason": "—", "is_open": True,
+        })
+    return pd.DataFrame(rows, columns=["entry_date", "exit_date", "days", "max_pos", "avg_cost",
+                                       "exit_price", "ret", "reason", "is_open"])
 
 
 # ==========================================
@@ -316,67 +356,97 @@ def describe_state(latest):
     return "空手", "等待進場條件", "#F9A825"
 
 
-def build_chart(plot_df, show_ma, show_bb, show_rsi):
+PROFIT_FILL = "rgba(239, 83, 80, 0.14)"   # 獲利：淺紅
+LOSS_FILL = "rgba(38, 166, 154, 0.16)"    # 虧損：淺綠
+
+
+def build_chart(plot_df, trades, show_ma, show_bb, show_rsi):
     rows = 2 if show_rsi else 1
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.05,
                         row_heights=[0.72, 0.28] if show_rsi else [1.0])
-
     idx = plot_df.index
+
+    # K棒：細邊框、實心填色；滑過時只顯示這根K棒的資訊
+    hover = [f"開 {o:.2f}<br>高 {h:.2f}<br>低 {l:.2f}<br>收 {c:.2f}" + ("" if pd.isna(g) else f"（{g:+.2f}%）")
+             for o, h, l, c, g in zip(plot_df["Open"], plot_df["High"], plot_df["Low"],
+                                      plot_df["Close"], plot_df["Chg_Pct"])]
     fig.add_trace(go.Candlestick(
         x=idx, open=plot_df["Open"], high=plot_df["High"], low=plot_df["Low"], close=plot_df["Close"],
-        name="K線", increasing_line_color="#ef5350", decreasing_line_color="#26a69a"), row=1, col=1)
+        name="K線", whiskerwidth=0, hovertext=hover, hoverinfo="text",
+        increasing=dict(line=dict(color="#ef5350", width=1), fillcolor="#ef5350"),
+        decreasing=dict(line=dict(color="#26a69a", width=1), fillcolor="#26a69a")), row=1, col=1)
 
+    # 其餘圖層都不顯示滑過資訊（hoverinfo="skip"）
     if show_ma:
-        fig.add_trace(go.Scatter(x=idx, y=plot_df["MA20"], name="MA20", mode="lines",
+        fig.add_trace(go.Scatter(x=idx, y=plot_df["MA20"], name="MA20", mode="lines", hoverinfo="skip",
                                  line=dict(color="#F9A825", width=1.2)), row=1, col=1)
-        fig.add_trace(go.Scatter(x=idx, y=plot_df["MA60"], name="MA60", mode="lines",
+        fig.add_trace(go.Scatter(x=idx, y=plot_df["MA60"], name="MA60", mode="lines", hoverinfo="skip",
                                  line=dict(color="#7E57C2", width=1.2)), row=1, col=1)
     if show_bb:
-        fig.add_trace(go.Scatter(x=idx, y=plot_df["BB_Lower"], name="布林下軌", mode="lines",
+        fig.add_trace(go.Scatter(x=idx, y=plot_df["BB_Lower"], name="布林下軌", mode="lines", hoverinfo="skip",
                                  line=dict(color="#90A4AE", width=1, dash="dot")), row=1, col=1)
 
     buys = plot_df[plot_df["Position_Shift"] > 0]
     sells = plot_df[plot_df["Position_Shift"] < 0]
     fig.add_trace(go.Scatter(
-        x=buys.index, y=buys["Low"] * 0.985, mode="markers", name="買進",
-        marker=dict(symbol="triangle-up", size=11, color="#FFD700", line=dict(width=1, color="#555")),
-        hovertext=[f"{a}　收盤 {c:.2f}" for a, c in zip(buys["Action"], buys["Close"])], hoverinfo="text"),
+        x=buys.index, y=buys["Low"] * 0.985, mode="markers", name="買進", hoverinfo="skip",
+        marker=dict(symbol="triangle-up", size=10, color="#FFD700", line=dict(width=1, color="#555"))),
         row=1, col=1)
     fig.add_trace(go.Scatter(
-        x=sells.index, y=sells["High"] * 1.015, mode="markers", name="賣出",
-        marker=dict(symbol="triangle-down", size=11, color="#1E90FF", line=dict(width=1, color="#555")),
-        hovertext=[f"{a}　收盤 {c:.2f}" for a, c in zip(sells["Action"], sells["Close"])], hoverinfo="text"),
+        x=sells.index, y=sells["High"] * 1.015, mode="markers", name="賣出", hoverinfo="skip",
+        marker=dict(symbol="triangle-down", size=10, color="#1E90FF", line=dict(width=1, color="#555"))),
         row=1, col=1)
 
     if show_rsi:
-        fig.add_trace(go.Scatter(x=idx, y=plot_df["RSI"], name="RSI(14)", mode="lines",
+        fig.add_trace(go.Scatter(x=idx, y=plot_df["RSI"], name="RSI(14)", mode="lines", hoverinfo="skip",
                                  line=dict(color="#42A5F5", width=1.3)), row=2, col=1)
-        for level, label in [(20, "20"), (32, "32"), (50, "50")]:
+        for level in (20, 32, 50):
             fig.add_hline(y=level, line_dash="dot", line_width=0.8, line_color="#9E9E9E",
-                          annotation_text=label, annotation_position="right", row=2, col=1)
+                          annotation_text=str(level), annotation_position="right", row=2, col=1)
         fig.update_yaxes(range=[0, 100], title_text="RSI", row=2, col=1)
 
-    # 持倉期間底色（部位越重顏色越深）。必須在圖層都建立之後才加入，否則子圖不會顯示。
-    pos = plot_df["Position"].to_numpy()
-    start = 0
-    for i in range(1, len(pos) + 1):
-        if i == len(pos) or pos[i] != pos[start]:
-            if pos[start] > 0:
-                x1 = idx[i] if i < len(pos) else idx[-1]
-                alpha = 0.08 + 0.12 * pos[start]
-                fig.add_vrect(x0=idx[start], x1=x1, fillcolor=f"rgba(255, 165, 0, {alpha:.3f})",
-                              layer="below", line_width=0, row=1, col=1)
-            start = i
+    # 每次交易的持有期間底色：獲利淺紅、虧損淺綠。
+    # 必須在圖層都建立之後才加入，否則子圖不會顯示。
+    lo, hi = idx[0], idx[-1]
+    for t in trades.itertuples():
+        x0 = t.entry_date
+        x1 = hi if pd.isna(t.exit_date) else t.exit_date
+        if x1 < lo or x0 > hi:
+            continue
+        fig.add_vrect(x0=max(x0, lo), x1=min(x1, hi),
+                      fillcolor=PROFIT_FILL if t.ret > 0 else LOSS_FILL,
+                      layer="below", line_width=0, row=1, col=1)
 
     # 隱藏週末與休市日，避免K線出現空隙
-    all_days = pd.date_range(idx.min(), idx.max(), freq="D")
+    all_days = pd.date_range(lo, hi, freq="D")
     missing = [d.strftime("%Y-%m-%d") for d in all_days.difference(idx)]
-    fig.update_xaxes(rangebreaks=[dict(values=missing)])
+    fig.update_xaxes(rangebreaks=[dict(values=missing)],
+                     showspikes=True, spikemode="across", spikesnap="cursor",
+                     spikethickness=1, spikedash="dot", spikecolor="#888")
+    fig.update_yaxes(showspikes=True, spikethickness=1, spikedash="dot", spikecolor="#888", row=1, col=1)
     fig.update_yaxes(title_text="價格 (NTD)", row=1, col=1)
     fig.update_layout(height=680 if show_rsi else 520, xaxis_rangeslider_visible=False,
                       margin=dict(l=10, r=10, t=30, b=10), dragmode="pan", hovermode="x",
                       legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0))
     return fig
+
+
+def style_trade_log(log):
+    """獲利標紅、虧損標綠（台股慣例）。回傳可交給 st.dataframe 的樣式物件。"""
+    def row_style(row):
+        v = row["漲跌幅"]
+        if pd.isna(v):
+            return [""] * len(row)
+        if v > 0:
+            css = "color: #ef5350; font-weight: 600; background-color: rgba(239, 83, 80, 0.14)"
+        else:
+            css = "color: #26a69a; font-weight: 600; background-color: rgba(38, 166, 154, 0.16)"
+        return [css if c in ("漲跌幅", "結果") else "" for c in row.index]
+
+    return (log.style
+            .format({"最高部位": "{:.0f}%", "均價": "{:.2f}", "出場價": "{:.2f}", "漲跌幅": "{:+.2f}%"},
+                    na_rep="—")
+            .apply(row_style, axis=1))
 
 
 # ==========================================
@@ -426,7 +496,7 @@ if st.sidebar.button("🔄 重新取得最新資料", help="資料預設每 2 �
     st.cache_data.clear()
 
 st.sidebar.subheader("圖表")
-range_label = st.sidebar.select_slider("顯示區間", options=list(CHART_RANGES.keys()), value="近 1 年")
+range_label = st.sidebar.select_slider("顯示區間", options=list(CHART_RANGES.keys()), value="近 3 個月")
 show_ma = st.sidebar.checkbox("均線 MA20 / MA60", value=True)
 show_bb = st.sidebar.checkbox("布林通道下軌", value=False)
 show_rsi = st.sidebar.checkbox("RSI 副圖", value=True)
@@ -491,9 +561,11 @@ else:
     c5.metric("停損價", "—", help="空手時沒有停損價")
 
 # ----- 圖表 -----
+trades = build_trades(result_df)
 days = CHART_RANGES[range_label]
 plot_df = result_df.tail(days) if days > 0 else result_df
-show_chart(build_chart(plot_df, show_ma, show_bb, show_rsi))
+show_chart(build_chart(plot_df, trades, show_ma, show_bb, show_rsi))
+st.caption("底色：淺紅＝該次交易獲利，淺綠＝虧損（持有中的交易以最新收盤價計算）。")
 for level, msg in notes:
     if level == "info":
         st.caption(msg)
@@ -502,19 +574,25 @@ for level, msg in notes:
 tab_log, tab_rules, tab_basis = st.tabs(["近期交易紀錄", "策略規則", "期現貨價差（參考）"])
 
 with tab_log:
-    trades = result_df[result_df["Position_Shift"] != 0].tail(10).iloc[::-1]
     if trades.empty:
         st.info("目前沒有任何進出場紀錄。")
     else:
+        recent = trades.tail(10).iloc[::-1]
         log = pd.DataFrame({
-            "日期": trades.index.strftime("%Y-%m-%d"),
-            "方向": np.where(trades["Position_Shift"] > 0, "買進", "賣出"),
-            "動作": trades["Action"].values,
-            "收盤價": trades["Close"].round(2).values,
-            "目標部位": (trades["Position"] * 100).round(0).astype(int).astype(str).values + "%",
+            "進場日": recent["entry_date"].dt.strftime("%Y-%m-%d").values,
+            "出場日": recent["exit_date"].dt.strftime("%Y-%m-%d").fillna("持有中").values,
+            "持有交易日": recent["days"].astype(int).values,
+            "最高部位": (recent["max_pos"] * 100).values,
+            "均價": recent["avg_cost"].values,
+            "出場價": recent["exit_price"].values,
+            "漲跌幅": recent["ret"].values,
+            "結果": np.where(recent["is_open"], "持有中",
+                           np.where(recent["ret"] > 0, "獲利", "虧損")),
+            "出場原因": recent["reason"].values,
         })
-        st.dataframe(log, hide_index=True)
-        st.caption("最近 10 筆，最新在最上方。價格為分割還原後的收盤價。")
+        st.dataframe(style_trade_log(log), hide_index=True)
+        st.caption("最近 10 次，最新在最上方。漲跌幅 = 出場收盤價 ÷ 加權均價 − 1，以訊號日收盤價計算，"
+                   "未計手續費與交易稅；持有中的交易為未實現漲跌幅。")
 
 with tab_rules:
     st.markdown("""
