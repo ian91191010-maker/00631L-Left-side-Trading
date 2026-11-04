@@ -53,6 +53,9 @@ PRESETS = {
                              use_tsi_pos=True, use_tsi_above_sig=True,
                              use_atr_stop=True, atr_mult=2.5, atr_buffer=5.0, exit_trend=True),
     "對照組": _preset(use_ma_entry=True, exit_dead_cross=True),
+    # 與「審計系統二」頁面相同：TSI 藍>紅進場、SMA5 跌破 SMA55 出場、沒有停損
+    "審計系統二": _preset(use_tsi_above_sig=True, tsi_r=25, tsi_s=13, tsi_sig=13,
+                     exit_dead_cross=True, ma_type="SMA", ma_short=5, ma_long=55),
 }
 
 SETTING_DEFAULTS = {
@@ -101,9 +104,9 @@ def on(f):
 # ============================================================
 sb = st.sidebar
 sb.subheader("預設組合")
-pc = sb.columns(3)
-for col, name in zip(pc, PRESETS):
-    col.button(name, on_click=load_preset, args=(name,), width="stretch")
+pc = sb.columns(2)
+for k, name in enumerate(PRESETS):
+    pc[k % 2].button(name, on_click=load_preset, args=(name,), width="stretch")
 sb.caption(f"最後載入：{st.session_state['loaded_preset']}（之後的修改不會改變這個標示）")
 
 with sb.expander("回測設定", expanded=False):

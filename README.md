@@ -1,8 +1,9 @@
 # 00631L 交易訊號 ＋ 策略回測
 
-一個網址、兩個頁面：
-- **主頁**：00631L 每日交易訊號（原本的程式，邏輯不變）
-- **策略回測**：勾選進出場、停損停利機制，測試不同策略組合的績效
+一個網址、三個頁面：
+- **主頁**：00631L 每日交易訊號（左側交易審計系統）
+- **策略回測**：勾選進出場、停損停利機制，測試不同策略組合的績效，並與審計系統比較
+- **審計系統二**：TSI 藍線 > 信號線進場、SMA5 跌破 SMA55 出場
 
 ## 檔案結構
 
@@ -10,13 +11,16 @@
 你的倉庫/
 ├─ app - 00631L-Left-side-Trading.py   主頁（交易訊號），Streamlit 的 Main file 指向它
 ├─ pages/
-│  └─ 1_策略回測.py                    回測頁面介面（等於 app.py）
+│  ├─ 1_策略回測.py                    回測頁面介面（等於 app.py）
+│  └─ 2_審計系統二.py                  審計系統二頁面
 ├─ bt/                                 回測模組
 │  ├─ __init__.py
 │  ├─ data.py                          抓資料、分割還原、週線轉換
 │  ├─ indicators.py                    SMA／EMA／TSI／ATR／ADX（TradingView 算法）
 │  ├─ strategy.py                      策略引擎（每個機制都是獨立函式）
 │  ├─ backtest.py                      績效、買進持有、參數比較
+│  ├─ baseline.py                      審計系統（主頁）的回測基準，邏輯與主頁相同
+│  ├─ audit2.py                        審計系統二的判斷邏輯
 │  └─ charts.py                        Plotly 圖表
 ├─ requirements.txt                    需要安裝的套件
 └─ .github/workflows/keep_alive.yml    防休眠排程
