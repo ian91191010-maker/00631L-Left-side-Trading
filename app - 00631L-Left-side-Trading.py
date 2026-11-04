@@ -84,6 +84,8 @@ def fetch_stock_data(symbol, start_date_obj, token):
     for c in cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["Close"])
+    # 沒有公告成交價的日子，FinMind 會把開高低收填 0，必須排除
+    df = df[(df["Close"] > 0) & (df["Open"] > 0) & (df["High"] > 0) & (df["Low"] > 0)]
     df = df.drop_duplicates(subset="Date", keep="last").set_index("Date").sort_index()
     if df.empty:
         raise ValueError(f"{symbol} 沒有有效的收盤價資料")

@@ -1,6 +1,6 @@
-streamlit
-yfinance
+streamlit>=1.50
 pandas
-numpy<2.0.0
-ta
+numpy
 plotly
+requests
+ta
