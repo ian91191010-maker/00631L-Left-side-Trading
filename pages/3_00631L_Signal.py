@@ -194,6 +194,22 @@ gd.on("plotly_hover", function (e) {
 gd.on("plotly_unhover", function () {
   var u = {}; u["shapes[" + D.cross + "].visible"] = false; Plotly.relayout(gd, u); show(D.d.length - 1);
 });
+function applyTheme() {
+  var col = "#31333f";
+  try { col = getComputedStyle(window.parent.document.querySelector(".stApp")).color; }
+  catch (e) { if (window.matchMedia("(prefers-color-scheme: dark)").matches) col = "#ece9e4"; }
+  var m = col.match(/[0-9]+/g).map(Number), lum = 0.299 * m[0] + 0.587 * m[1] + 0.114 * m[2];
+  var grid = lum > 128 ? "rgba(255,255,255,0.10)" : "rgba(0,0,0,0.08)", u = {"font.color": col};
+  document.getElementById("strip").style.color = col;
+  ["", "2", "3", "4"].forEach(function (k) {
+    u["xaxis" + k + ".tickfont.color"] = col; u["xaxis" + k + ".gridcolor"] = grid;
+    u["yaxis" + k + ".tickfont.color"] = col; u["yaxis" + k + ".gridcolor"] = grid;
+  });
+  for (var j = 0; j < 3; j++) u["annotations[" + (D.note + j) + "].font.color"] = col;
+  u["shapes[" + D.cross + "].line.color"] = col;
+  Plotly.relayout(gd, u);
+}
+applyTheme();
 show(D.d.length - 1);
 </script>
 """
