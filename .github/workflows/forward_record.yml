@@ -1,0 +1,68 @@
+name: Forward record
+
+# 每天早上（台北 08:00）記下前一個交易日的訊號到 data/forward_log.csv（只增不改）。
+# 2026-12-01 之前自動排程不會執行（Actions 額度 12/1 恢復）；想先測試，按 Actions 頁的 Run workflow 手動執行。
+on:
+  schedule:
+    - cron: "0 0 * * 1-6"   # UTC 00:00 ＝ 台北 08:00，週一到週六（週六記下週五）
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip scheduled runs before 2026-12-01
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(TZ=Asia/Taipei date +%Y%m%d)" -lt 20261201 ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "排程要等到 2026-12-01 才開始，今天略過。"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install requirements
+        if: steps.gate.outputs.run == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Record signals
+        if: steps.gate.outputs.run == 'true'
+        env:
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+        run: python forward/record.py
+
+      - name: Check the log was only appended to
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          # 已存在的列不可被改動或刪除：這個檔案的差異裡，刪除行數必須是 0
+          if [ -f data/forward_log.csv ] && git ls-files --error-unmatch data/forward_log.csv >/dev/null 2>&1; then
+            deleted=$(git diff --numstat -- data/forward_log.csv | awk '{print $2}')
+            if [ -n "$deleted" ] && [ "$deleted" != "0" ]; then
+              echo "記錄檔有被改動或刪除的行，停止提交。"; exit 1
+            fi
+          fi
+
+      - name: Commit the new rows
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          if [ -n "$(git status --porcelain data/forward_log.csv)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data/forward_log.csv
+            git commit -m "forward record: $(TZ=Asia/Taipei date +%Y-%m-%d)"
+            git push
+          else
+            echo "沒有新的記錄。"
+          fi

@@ -160,6 +160,9 @@ st.markdown(f"""
   </div>
 </div>
 """, unsafe_allow_html=True)
+if last_tx == pd.Timestamp(D.today_tw()):
+    st.info(f"台指期 {last_tx:%Y-%m-%d} 的結算價是今天剛取得的，FinMind 可能還沒定案（成交量偏低、價格偏離時要小心）。"
+            "正式訊號以隔天早上的資料為準。")
 if last_tx < p.index[-1]:
     st.info(f"台指期資料只到 {last_tx:%Y-%m-%d}，比 00631L 舊；今天的訊號等 FinMind 更新後再按「重新取得最新資料」。")
 
