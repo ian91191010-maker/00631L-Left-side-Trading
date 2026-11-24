@@ -147,9 +147,12 @@ def build_chart(p, tx, gauge, g5, trades):
                            yanchor="bottom", showarrow=False, font=dict(color=txt, size=12))
     n_note = len(fig.layout.annotations) - 3            # 前面的「資料尚未送入」不算
     missing = [d.strftime("%Y-%m-%d") for d in pd.date_range(lo, hi, freq="D").difference(idx)]
-    fig.update_xaxes(rangebreaks=[dict(values=missing)], gridcolor=grid, linecolor=grid, tickfont=dict(color=txt))
+    fig.update_xaxes(rangebreaks=[dict(values=missing)], gridcolor=grid, linecolor=grid, tickfont=dict(color=txt),
+                     tickformatstops=[dict(dtickrange=[None, "M1"], value="%m-%d"),
+                                      dict(dtickrange=["M1", "M12"], value="%Y-%m"),
+                                      dict(dtickrange=["M12", None], value="%Y")])
     fig.update_yaxes(gridcolor=grid, zeroline=False, tickfont=dict(color=txt), automargin=True)
-    fig.update_layout(height=900, xaxis_rangeslider_visible=False, margin=dict(l=8, r=8, t=8, b=8),
+    fig.update_layout(height=940, xaxis_rangeslider_visible=False, margin=dict(l=8, r=8, t=8, b=44),
                       dragmode="pan", hovermode="x", showlegend=False, paper_bgcolor="rgba(0,0,0,0)",
                       plot_bgcolor="rgba(0,0,0,0)", font=dict(color=txt))
     data = {
@@ -194,6 +197,22 @@ gd.on("plotly_hover", function (e) {
 gd.on("plotly_unhover", function () {
   var u = {}; u["shapes[" + D.cross + "].visible"] = false; Plotly.relayout(gd, u); show(D.d.length - 1);
 });
+function applyTheme() {
+  var col = "#31333f";
+  try { col = getComputedStyle(window.parent.document.querySelector(".stApp")).color; }
+  catch (e) { if (window.matchMedia("(prefers-color-scheme: dark)").matches) col = "#ece9e4"; }
+  var m = col.match(/[0-9]+/g).map(Number), lum = 0.299 * m[0] + 0.587 * m[1] + 0.114 * m[2];
+  var grid = lum > 128 ? "rgba(255,255,255,0.10)" : "rgba(0,0,0,0.08)", u = {"font.color": col};
+  document.getElementById("strip").style.color = col;
+  ["", "2", "3", "4"].forEach(function (k) {
+    u["xaxis" + k + ".tickfont.color"] = col; u["xaxis" + k + ".gridcolor"] = grid;
+    u["yaxis" + k + ".tickfont.color"] = col; u["yaxis" + k + ".gridcolor"] = grid;
+  });
+  for (var j = 0; j < 3; j++) u["annotations[" + (D.note + j) + "].font.color"] = col;
+  u["shapes[" + D.cross + "].line.color"] = col;
+  Plotly.relayout(gd, u);
+}
+applyTheme();
 show(D.d.length - 1);
 </script>
 """
@@ -264,7 +283,7 @@ plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn", div_id="pc",
                         config={"displaylogo": False, "scrollZoom": True, "displayModeBar": False})
 html = (CHART_HTML.replace("__TXT__", txt_color).replace("__PLOT__", plot_html)
         .replace("__DATA__", json.dumps(chart_data, allow_nan=False)).replace("__UP__", UP).replace("__DOWN__", DOWN))
-components.html(html, height=950)
+components.html(html, height=1000)
 
 tab_log, tab_perf = st.tabs(["近期交易紀錄", "績效對照"])
 with tab_log:
