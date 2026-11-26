@@ -183,6 +183,7 @@ CHART_HTML = """
 <style>
 #strip {font:14px/1.5 'Source Sans Pro',sans-serif;min-height:24px;font-variant-numeric:tabular-nums;margin:0 0 4px 4px}
 #box {position:relative}
+#box.touch, #box.touch * {touch-action: pan-y !important}
 .ov {position:absolute;pointer-events:none;z-index:5}
 .lbl {font:12px 'Source Sans Pro',sans-serif;white-space:nowrap;font-variant-numeric:tabular-nums}
 #vline {top:0;width:0;border-left:1px dotted;display:none}
@@ -246,6 +247,65 @@ box.addEventListener("mousemove", function (e) {
   var r = box.getBoundingClientRect(); queue({x: e.clientX - r.left, y: e.clientY - r.top});
 });
 box.addEventListener("mouseleave", function () { queue({hide: true}); });
+
+// ---------- 手機觸控 ----------
+// 一指左右滑＝對齊線跟著手指（上下滑交給瀏覽器捲動網頁）；一指點一下＝對齊線跳到那一天；
+// 兩指捏合／張開＝縮放，兩指一起移動＝平移。
+var TOUCH = window.matchMedia && window.matchMedia("(pointer: coarse)").matches;
+if (TOUCH) box.classList.add("touch");
+function tpos(t) { var r = box.getBoundingClientRect(); return {x: t.clientX - r.left, y: t.clientY - r.top}; }
+var swipe = null, pinch = null, pinchPending = null, pinchBusy = false, pinchQueued = false;
+function pinchStep() {
+  pinchQueued = false;
+  if (pinchBusy || !pinchPending) return;
+  var r = pinchPending; pinchPending = null; pinchBusy = true;
+  Plotly.relayout(gd, {"xaxis.range": r}).then(done, done);
+  function done() { pinchBusy = false; if (pinchPending) schedPinch(); }
+}
+function schedPinch() { if (!pinchQueued) { pinchQueued = true; requestAnimationFrame(pinchStep); } }
+// 觸控事件全部由這段程式處理、不交給 Plotly（Plotly 收到觸控會擋住網頁捲動）
+box.addEventListener("touchstart", function (e) {
+  e.stopPropagation();
+  if (e.touches.length >= 2) {
+    e.preventDefault(); e.stopPropagation();
+    var a = tpos(e.touches[0]), b = tpos(e.touches[1]), s = size(), r = xa().range.map(Number);
+    pinch = {d0: Math.max(30, Math.abs(a.x - b.x)), c0: xa().p2l((a.x + b.x) / 2 - s.l), r0: r};
+    vline.style.display = "none";
+  } else if (e.touches.length === 1 && !pinch) {
+    var p0 = tpos(e.touches[0]); swipe = {x: p0.x, y: p0.y, dir: null};
+  }
+}, {passive: false, capture: true});
+box.addEventListener("touchmove", function (e) {
+  e.stopPropagation();
+  if (pinch && e.touches.length >= 2) {
+    e.preventDefault(); e.stopPropagation();
+    var a = tpos(e.touches[0]), b = tpos(e.touches[1]), s = size(), n = D.d.length;
+    var d = Math.max(30, Math.abs(a.x - b.x)), cx = (a.x + b.x) / 2 - s.l;
+    var span = Math.max(15, Math.min(n, (pinch.r0[1] - pinch.r0[0]) * pinch.d0 / d));
+    var lo = pinch.c0 - cx / s.w * span, hi = lo + span;          // 兩指中間那一天保持在兩指中間
+    if (lo < -0.5) { hi += -0.5 - lo; lo = -0.5; }
+    if (hi > n - 0.5) { lo -= hi - (n - 0.5); hi = n - 0.5; }
+    pinchPending = [lo, hi]; schedPinch();
+  } else if (!pinch && e.touches.length === 1 && swipe) {
+    var p = tpos(e.touches[0]);
+    if (!swipe.dir) {                                              // 先看手指往哪個方向動，決定後整個手勢都照這個方向
+      var dx = Math.abs(p.x - swipe.x), dy = Math.abs(p.y - swipe.y);
+      if (dx < 6 && dy < 6) return;
+      swipe.dir = dx > dy ? "h" : "v";
+    }
+    if (swipe.dir === "h") { e.preventDefault(); queue(p); }        // 左右：移動對齊線；上下：不攔截，網頁照常捲動
+  }
+}, {passive: false, capture: true});
+function touchEnd(e) {
+  e.stopPropagation();
+  if (pinch && e.touches.length < 2) pinch = null;
+  if (!e.touches.length) {
+    if (swipe && !swipe.dir && e.type === "touchend") queue({x: swipe.x, y: swipe.y});   // 點一下（沒有移動）：對齊線跳到那一天
+    swipe = null;
+  }
+}
+box.addEventListener("touchend", touchEnd, {capture: true});
+box.addEventListener("touchcancel", touchEnd, {capture: true});
 gd.on("plotly_afterplot", place);
 // 拖曳、縮放停下來 0.15 秒後，上面三張圖的縱軸自動貼合目前看得到的資料（只重畫一次）
 var fitTimer = null, fitting = false;
@@ -295,6 +355,7 @@ function applyTheme() {
     u["xaxis" + k + ".tickfont.color"] = col; u["xaxis" + k + ".gridcolor"] = grid;
     u["yaxis" + k + ".tickfont.color"] = col; u["yaxis" + k + ".gridcolor"] = grid;
   });
+  if (TOUCH) u["dragmode"] = false;   // 手機：一指不拖曳圖表（才能上下捲動網頁），改用兩指平移
   Plotly.relayout(gd, u);       // 只在載入時執行一次
 }
 applyTheme();
