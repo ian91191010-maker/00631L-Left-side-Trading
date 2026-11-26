@@ -85,17 +85,38 @@ def _ds(x):
     return pd.Timestamp(x).strftime("%Y-%m-%d")
 
 
+LOD_DAY_MAX, LOD_WEEK_MAX = 600, 2000      # 看得到的交易日 ≤600：日K；≤2000：週K；更多：月K
+
+
+def _agg(p, key):
+    """把日K合併成週K或月K（照日曆週、月），K 棒放在該期間最後一個交易日的位置。"""
+    g = p.groupby(key)
+    return {"x": [_ds(d) for d in g.apply(lambda x: x.index[-1])], "o": _clean(g["Open"].first()),
+            "h": _clean(g["High"].max()), "l": _clean(g["Low"].min()), "c": _clean(g["Close"].last())}
+
+
+def lod_level(n_bars):
+    return "D" if n_bars <= LOD_DAY_MAX else ("W" if n_bars <= LOD_WEEK_MAX else "M")
+
+
 def build_chart(p, tx, gauge, g5, trades):
     """四張圖共用同一條橫軸：K 線、台指期與轉折、風險指標、風控指標。"""
     txt, grid = theme_colors()
     idx = p.index
     fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.055, row_heights=ROW_HEIGHTS)
     nohover = dict(hoverinfo="none")
-    fig.add_trace(go.Candlestick(
-        x=idx, open=p["Open"], high=p["High"], low=p["Low"], close=p["Close"], name="00631L",
-        whiskerwidth=0, showlegend=False, **nohover,
-        increasing=dict(line=dict(color=UP, width=1), fillcolor=UP),
-        decreasing=dict(line=dict(color=DOWN, width=1), fillcolor=DOWN)), row=1, col=1)
+    # 日K、週K、月K 三層都先畫好，只顯示一層；縮放時切換「顯示哪一層」，不替換資料
+    # （替換資料會讓 Plotly 把類別軸重新判斷成日期軸）。K 棒太多時看週K／月K：瀏覽器畫 3,000 根很慢，也看不清楚。
+    lods = {"D": {"x": list(idx), "o": p["Open"], "h": p["High"], "l": p["Low"], "c": p["Close"]},
+            "W": _agg(p, p.index.to_period("W-SUN")), "M": _agg(p, p.index.to_period("M"))}
+    level = lod_level(len(idx))
+    for lv in ("D", "W", "M"):
+        src = lods[lv]
+        fig.add_trace(go.Candlestick(
+            x=src["x"], open=src["o"], high=src["h"], low=src["l"], close=src["c"], name=f"00631L {lv}",
+            whiskerwidth=0, showlegend=False, visible=(lv == level), **nohover,
+            increasing=dict(line=dict(color=UP, width=1), fillcolor=UP),
+            decreasing=dict(line=dict(color=DOWN, width=1), fillcolor=DOWN)), row=1, col=1)
     buys, sells = p[p["Entry"]], p[p["Exit"]]
     fig.add_trace(go.Scatter(x=buys.index, y=buys["Low"] * 0.985, mode="markers", hoverinfo="skip", showlegend=False,
                              marker=dict(symbol="triangle-up", size=10, color="#FFD700",
@@ -141,15 +162,17 @@ def build_chart(p, tx, gauge, g5, trades):
     for trace in fig.data:
         trace.x = [_ds(x) for x in trace.x]
     fig.update_xaxes(type="category", categoryorder="array", categoryarray=[_ds(d) for d in idx],
+                     range=[-0.5, len(idx) - 0.5],
                      nticks=8, tickangle=0, gridcolor=grid, linecolor=grid, tickfont=dict(color=txt))
     fig.update_yaxes(gridcolor=grid, zeroline=False, tickfont=dict(color=txt), automargin=True)
     fig.update_layout(height=940, xaxis_rangeslider_visible=False, margin=dict(l=8, r=8, t=8, b=44),
-                      dragmode="pan", hovermode="x", showlegend=False, paper_bgcolor="rgba(0,0,0,0)",
+                      dragmode="pan", hovermode=False, showlegend=False, paper_bgcolor="rgba(0,0,0,0)",
                       plot_bgcolor="rgba(0,0,0,0)", font=dict(color=txt))
     data = {
         "d": [d.strftime("%Y-%m-%d") for d in idx],
         "o": _clean(p["Open"]), "h": _clean(p["High"]), "l": _clean(p["Low"]), "c": _clean(p["Close"]),
         "tx": _clean(t["Close"], 0), "n": _clean(t["N"], 0), "dif": _clean(g["DIF"], 0), "g5": _clean(r["g5_close"]),
+        "lv": level, "dmax": LOD_DAY_MAX, "wmax": LOD_WEEK_MAX,
         "dom": doms, "hi": _clean(g["DIF_HI"], 0), "lo": _clean(g["DIF_LO"], 0),
     }
     return fig, data, txt
@@ -168,13 +191,13 @@ CHART_HTML = """
 <div id="box">
 __PLOT__
 <div id="vline" class="ov"></div>
-<div id="l2" class="ov lbl"></div><div id="l3" class="ov lbl"></div><div id="l4" class="ov lbl"></div>
+<div id="l1" class="ov lbl"></div><div id="l2" class="ov lbl"></div><div id="l3" class="ov lbl"></div><div id="l4" class="ov lbl"></div>
 </div>
 <script>
 // 滑鼠移動時只改文字層（十字線、K 線資訊、三張副圖的數值），不呼叫 Plotly.relayout，圖表不重畫。
 var D = __DATA__, UPC = "__UP__", DNC = "__DOWN__";
 var gd = document.getElementById("pc"), box = document.getElementById("box"), ix = {};
-var vline = document.getElementById("vline"), L = {2: document.getElementById("l2"), 3: document.getElementById("l3"), 4: document.getElementById("l4")};
+var vline = document.getElementById("vline"), L = {1: document.getElementById("l1"), 2: document.getElementById("l2"), 3: document.getElementById("l3"), 4: document.getElementById("l4")};
 D.d.forEach(function (s, i) { ix[s] = i; });
 function f(v, n) { return v === null ? "—" : Number(v).toLocaleString("en-US", {minimumFractionDigits: n, maximumFractionDigits: n}); }
 function size() {
@@ -187,6 +210,7 @@ function place() {            // 依目前圖表尺寸擺好標籤與十字線�
     L[r].style.left = s.l + "px";
     L[r].style.top = (s.t + (1 - D.dom[r][1]) * s.h - 18) + "px";
   });
+  L[1].style.left = (s.l + 6) + "px"; L[1].style.top = (s.t + 4) + "px";
   vline.style.top = s.t + "px"; vline.style.height = s.h + "px";
 }
 var last = -1;
@@ -201,24 +225,27 @@ function show(i) {
   L[3].textContent = "風險指標　" + f(D.dif[i], 0);
   L[4].textContent = "風控指標　" + (D.g5[i] === null ? "—" : f(D.g5[i], 2));
 }
-var pending = null, queued = false;
-function frame() {             // 每個畫面更新週期最多處理一次滑鼠事件
+// 滑鼠位置 → 第幾根 K 棒：直接用橫軸換算（Plotly 內建的滑鼠提示已關閉，它對 3,000 根 K 棒非常耗時）
+var mouse = null, queued = false;
+function xa() { return gd._fullLayout.xaxis; }
+function frame() {             // 每個畫面更新週期最多處理一次滑鼠移動
   queued = false;
-  if (!pending) return;
-  var e = pending; pending = null;
-  if (e.hide) { vline.style.display = "none"; show(D.d.length - 1); return; }
-  var x = String(e.points[0].x).slice(0, 10), i = ix[x];
-  if (i === undefined) return;
-  if (e.event && e.event.clientX !== undefined) {
-    var s = size(), px = e.event.clientX - box.getBoundingClientRect().left;
-    if (px >= s.l && px <= s.l + s.w) { vline.style.left = px + "px"; vline.style.display = "block"; }
-  }
+  if (!mouse) return;
+  var m = mouse; mouse = null;
+  if (m.hide) { vline.style.display = "none"; show(D.d.length - 1); return; }
+  var s = size(), px = m.x - s.l, py = m.y - s.t;
+  if (px < 0 || px > s.w || py < 0 || py > s.h) { vline.style.display = "none"; show(D.d.length - 1); return; }
+  var i = Math.round(xa().p2l(px));
+  if (i < 0 || i >= D.d.length) return;
+  vline.style.left = (s.l + xa().l2p(i)) + "px"; vline.style.display = "block";
   show(i);
 }
-function queue(e) { pending = e; if (!queued) { queued = true; requestAnimationFrame(frame); } }
-gd.on("plotly_hover", queue);
-gd.on("plotly_unhover", function () { queue({hide: true}); });
-gd.on("plotly_relayouting", function () { vline.style.display = "none"; });   // 拖曳中先藏十字線
+function queue(m) { mouse = m; if (!queued) { queued = true; requestAnimationFrame(frame); } }
+box.addEventListener("mousemove", function (e) {
+  if (e.buttons) { vline.style.display = "none"; return; }     // 拖曳中先藏十字線
+  var r = box.getBoundingClientRect(); queue({x: e.clientX - r.left, y: e.clientY - r.top});
+});
+box.addEventListener("mouseleave", function () { queue({hide: true}); });
 gd.on("plotly_afterplot", place);
 // 拖曳、縮放停下來 0.15 秒後，上面三張圖的縱軸自動貼合目前看得到的資料（只重畫一次）
 var fitTimer = null, fitting = false;
@@ -229,15 +256,24 @@ function span(arrs, a, b) {
   var pad = (hi - lo) * 0.06 || Math.abs(hi) * 0.02 || 1;
   return [lo - pad, hi + pad];
 }
-function fitY() {
-  var r = gd._fullLayout.xaxis.range, n = D.d.length;
-  var a = Math.max(0, Math.ceil(r[0])), b = Math.min(n - 1, Math.floor(r[1]));
-  if (b < a) return;
-  var u = {}, y1 = span([D.l, D.h], a, b), y2 = span([D.tx, D.n], a, b), y3 = span([D.dif, D.hi, D.lo], a, b);
+function yFit(r0, r1) {        // 回傳三張圖貼合 [r0, r1] 這段可見資料的縱軸範圍
+  var n = D.d.length, a = Math.max(0, Math.ceil(r0)), b = Math.min(n - 1, Math.floor(r1)), u = {};
+  if (b < a) return u;
+  var y1 = span([D.l, D.h], a, b), y2 = span([D.tx, D.n], a, b), y3 = span([D.dif, D.hi, D.lo], a, b);
   if (y1) { y1[0] = Math.min(y1[0], y1[0] * 0.985); u["yaxis.range"] = y1; }   // 留位置給買賣三角形
   if (y2) u["yaxis2.range"] = y2;
   if (y3) u["yaxis3.range"] = y3;
-  fitting = true; Plotly.relayout(gd, u).then(function () { fitting = false; }, function () { fitting = false; });
+  return u;
+}
+var LV_NAME = {D: "日K", W: "週K", M: "月K"}, curLv = D.lv;
+function lvTag() { L[1].textContent = "K 線：" + LV_NAME[curLv] + (curLv === "D" ? "" : "（放大後自動切換成日K）"); }
+function fitY() {               // 縱軸貼合可見資料；K 棒數量變了就切換日K／週K／月K，全部在同一次重畫完成
+  var r = xa().range, nVis = r[1] - r[0], lv = nVis <= D.dmax ? "D" : (nVis <= D.wmax ? "W" : "M");
+  var data = {}, traces = [0, 1, 2];                // 前三條線＝日K、週K、月K
+  if (lv !== curLv) { data = {visible: [lv === "D", lv === "W", lv === "M"]}; curLv = lv; lvTag(); }
+  else { traces = []; }
+  fitting = true;
+  Plotly.update(gd, data, yFit(r[0], r[1]), traces).then(function () { fitting = false; }, function () { fitting = false; });
 }
 gd.on("plotly_relayout", function (e) {
   if (fitting) return;
@@ -252,7 +288,8 @@ function applyTheme() {
   var m = col.match(/[0-9]+/g).map(Number), lum = 0.299 * m[0] + 0.587 * m[1] + 0.114 * m[2];
   var grid = lum > 128 ? "rgba(255,255,255,0.10)" : "rgba(0,0,0,0.08)", u = {"font.color": col};
   document.getElementById("strip").style.color = col;
-  [2, 3, 4].forEach(function (r) { L[r].style.color = col; });
+  [1, 2, 3, 4].forEach(function (r) { L[r].style.color = col; });
+  L[1].style.opacity = 0.7;
   vline.style.borderColor = col;
   ["", "2", "3", "4"].forEach(function (k) {
     u["xaxis" + k + ".tickfont.color"] = col; u["xaxis" + k + ".gridcolor"] = grid;
@@ -261,6 +298,7 @@ function applyTheme() {
   Plotly.relayout(gd, u);       // 只在載入時執行一次
 }
 applyTheme();
+lvTag();
 place();
 show(D.d.length - 1);
 </script>
