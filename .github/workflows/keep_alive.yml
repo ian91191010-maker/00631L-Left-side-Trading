@@ -11,7 +11,7 @@ jobs:
     timeout-minutes: 10
     env:
       # ▼▼▼ 只需要改這一行：換成你的 Streamlit 網址 ▼▼▼
-      APP_URL: "https://00631l-left-side-trading-j2ewt58toqbedb2z5reulf.streamlit.app/"
+      APP_URL: "https://00631l-signal.streamlit.app/"
     steps:
       - uses: actions/setup-python@v5
         with:
