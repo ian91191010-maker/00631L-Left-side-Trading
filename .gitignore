@@ -1,0 +1,16 @@
+# 金鑰：絕對不要推上 GitHub
+.streamlit/secrets.toml
+.env
+*.env
+
+# Python 產生的暫存
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# 編輯器與系統
+.vscode/
+.idea/
+.DS_Store

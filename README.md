@@ -1,48 +1,47 @@
-# 00631L 交易訊號 ＋ 策略回測
+# 00631L Signal
 
-一個網址、五個頁面：
-- **主頁**：00631L 每日交易訊號（左側交易審計系統）
-- **策略回測**：勾選進出場、停損停利機制，測試不同策略組合的績效，並與審計系統比較
-- **審計系統二**：TSI 藍線 > 信號線進場、SMA5 跌破 SMA55 出場
-- **00631L Signal**：00631L 的進出場訊號（正式訊號）、K 線，加上風險指標、風控指標兩張圖；沒有側邊欄，導覽在頁面最下方
-- **前向記錄**：每天記下 F0 與審計系統二原版的訊號，純做紀錄（`data/forward_log.csv`，只增不改）
+用台指期的「當月轉折（F0）」判斷 00631L 的進出場，網站只有一頁：訊號卡、K 線、台指期與轉折、風險指標、風控指標、交易紀錄與績效對照。
+
+另外每天早上由 GitHub Actions 記下前一個交易日的 F0 與「審計系統二」訊號（`data/forward_log.csv`，只增不改），純做紀錄，網頁不顯示。
 
 ## 檔案結構
 
 ```
 你的倉庫/
-├─ app - 00631L-Left-side-Trading.py   主頁（交易訊號），Streamlit 的 Main file 指向它
-├─ pages/
-│  ├─ 1_策略回測.py                    回測頁面介面（等於 app.py）
-│  ├─ 2_審計系統二.py                  審計系統二頁面
-│  ├─ 3_00631L_Signal.py               00631L Signal 頁面
-│  └─ 4_前向記錄.py                    前向記錄頁面
-├─ forward/record.py                   每日記錄腳本（只在檔案尾端追加）
-├─ data/g5_daily.csv                   風控指標資料（60 分 RSI60），由私人庫算好送入；格式見 bt/gauges.py
-├─ data/forward_log.csv                前向記錄（由排程產生，不要手動改）
-├─ bt/                                 回測模組
-│  ├─ __init__.py
-│  ├─ data.py                          抓資料、分割還原、週線轉換
-│  ├─ indicators.py                    SMA／EMA／TSI／ATR／ADX（TradingView 算法）
-│  ├─ strategy.py                      策略引擎（每個機制都是獨立函式）
-│  ├─ backtest.py                      績效、買進持有、參數比較
-│  ├─ baseline.py                      審計系統（主頁）的回測基準，邏輯與主頁相同
-│  ├─ audit2.py                        審計系統二的判斷邏輯
-│  ├─ gauges.py                        風險指標（日 MACD 的 DIF）與風控指標（60 分 RSI60）資料
-│  ├─ f0.py                            轉折 F0 的判斷邏輯與套用到 00631L
-│  └─ charts.py                        Plotly 圖表
-├─ requirements.txt                    需要安裝的套件
-├─ .github/workflows/keep_alive.yml    防休眠排程
-└─ .github/workflows/forward_record.yml  每日前向記錄排程（2026-12-01 起自動執行）
+├─ app.py                  網站唯一的頁面（Streamlit 的 Main file 指向它）
+├─ ui/cache.py             網頁快取：TTL、按年保存台指期、「重新取得」與 10 分鐘冷卻
+├─ bt/                     計算模組（純 Python，不依賴 Streamlit；網頁與排程共用）
+│  ├─ finmind.py           FinMind API 唯一出口：重試、Token 只放 header、錯誤訊息不含 Token
+│  ├─ data.py              00631L／加權指數日K、分割還原
+│  ├─ f0.py                轉折 F0（台指期近月、當月轉折、套用到 00631L、績效）
+│  ├─ costs.py             交易成本：手續費 3 折、無滑價、ETF 證交稅 0.1%
+│  ├─ gauges.py            風險指標、風控指標（data/g5_daily.csv）
+│  ├─ audit2.py            審計系統二（只給前向記錄做對照）
+│  └─ indicators.py        技術指標
+├─ forward/record.py       每日前向記錄腳本
+├─ data/g5_daily.csv       風控指標資料（由私人庫算好送入）
+├─ data/forward_log.csv    前向記錄（排程產生，不要手動改）
+├─ tests/test_app.py       自動測試（不需要 Token）
+├─ requirements.txt        網站需要的套件（已鎖主版本）
+├─ requirements-dev.txt    測試用套件
+└─ .github/workflows/      keep_alive.yml（防休眠）、forward_record.yml（每日記錄）
 ```
 
-## 新增指標或機制
+## 資料更新與 FinMind 額度
 
-- 指標：在 `bt/indicators.py` 寫一個函式，再到 `bt/strategy.py` 的 `build_indicators()` 加一行。
-- 進場條件：在 `bt/strategy.py` 寫 `cond_xxx(ind, cfg)`，加進 `ENTRY_RULES`。
-- 訊號出場：寫 `exit_xxx(ind, cfg)`，依優先順序加進 `SIGNAL_EXITS`。
-- 停損停利：寫一個回傳價格的函式，加進 `_Engine.stop_levels()`。
-- 參數要出現在側邊欄：在 `StrategyConfig` 加欄位，並在 `pages/1_策略回測.py` 加一個輸入框。
+- 日K與今年的台指期每 2 小時更新一次；去年以前的台指期保存 30 天（資料不會再變）。
+- 「重新取得最新資料」只清這一頁的快取，全站 10 分鐘內只能按一次，避免額度被用光。
+- 第一次開站（或伺服器重開）約打 15 次 API，之後每 2 小時約 3 次。
+
+## 本機執行與測試
+
+```
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest -q          # 自動測試，不需要 Token
+streamlit run app.py         # 需要 .streamlit/secrets.toml 裡有 FINMIND_TOKEN
+```
+
+`.streamlit/secrets.toml` 已列在 `.gitignore`，不會被推上 GitHub。
 
 ## 分割事件
 
@@ -51,6 +50,6 @@
 
 ## 前向記錄排程
 
-- 需要在 GitHub 儲存庫的 Settings → Secrets and variables → Actions 新增 `FINMIND_TOKEN`。
-- 每天台北 08:00 記下前一個交易日；2026-12-01 之前自動排程會略過，想先測試可到 Actions 頁手動 Run workflow。
+- GitHub 儲存庫 Settings → Secrets and variables → Actions 需要有 `FINMIND_TOKEN`。
+- 每天台北 08:00 記下前一個交易日；2026-12-01 之前自動排程會略過，可到 Actions 頁手動 Run workflow 測試。
 - 記錄檔只在尾端新增；排程裡有檢查，若已存在的行被改動會停止提交。

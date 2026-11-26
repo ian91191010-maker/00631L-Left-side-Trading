@@ -1,20 +1,21 @@
 # -*- coding: utf-8 -*-
-"""資料模組：從 FinMind 抓日K，處理分割還原，並可轉成週線。
+"""資料模組：從 FinMind 抓日K，處理分割還原。純計算，不依賴 Streamlit（排程與網頁共用）。
 
 FinMind 免費帳號不能使用「還原股價」資料集（TaiwanStockPriceAdj 只限付費會員），
 所以這裡用原始日K（TaiwanStockPrice）＋程式內建的分割表自行還原。
 - 00631L 不配息，分割還原後就是正確的還原價。
-- 其他會配息的股票，沒有還原除權息，報酬會被低估（頁面會顯示提醒）。
+- 其他會配息的股票沒有還原除權息（會顯示提醒）。
+
+快取由網頁那一層（ui/cache.py）負責，這裡不快取。
 """
 from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
-import requests
-import streamlit as st
 
-FINMIND_URL = "https://api.finmindtrade.com/api/v4/data"
+from . import finmind
+
 TW_TZ = timezone(timedelta(hours=8))
-DATA_START = date(2010, 1, 1)  # 一律抓完整歷史，回測區間在之後才切，指標才有足夠的暖機資料
+DATA_START = date(2010, 1, 1)  # 一律抓完整歷史，指標才有足夠的暖機資料
 
 # 已知分割事件：{代號: [(生效日, 分割倍數), ...]}
 SPLIT_EVENTS = {
@@ -31,29 +32,17 @@ def today_tw():
     return datetime.now(TW_TZ).date()
 
 
-def _finmind_request(dataset, data_id, start_date_obj, token):
-    params = {
-        "dataset": dataset,
-        "data_id": data_id,
-        "start_date": start_date_obj.strftime("%Y-%m-%d"),
-        "end_date": today_tw().strftime("%Y-%m-%d"),
-    }
-    headers = {"Authorization": f"Bearer {token}"}
-    res = requests.get(FINMIND_URL, params=params, headers=headers, timeout=30)
-    res.raise_for_status()
-    payload = res.json()
-    if payload.get("status", 200) != 200:
-        raise RuntimeError(f"FinMind 回應錯誤（{dataset} {data_id}）：{payload.get('msg', payload.get('status'))}")
-    return pd.DataFrame(payload.get("data", []))
-
-
-@st.cache_data(show_spinner=False, ttl=6 * 3600)
 def fetch_daily(symbol, token):
-    """抓取原始日K。失敗會直接丟出錯誤（不會被快取）。"""
-    df = _finmind_request("TaiwanStockPrice", symbol, DATA_START, token)
+    """從 FinMind 抓原始日K（全部歷史）。失敗會丟出 finmind.FinMindError。"""
+    rows = finmind.request("TaiwanStockPrice", symbol, DATA_START, today_tw(), token)
+    return clean_daily(rows, symbol)
+
+
+def clean_daily(rows, symbol):
+    """FinMind 原始列 → 以日期為索引的 Open/High/Low/Close/Volume 表。"""
+    df = pd.DataFrame(rows)
     if df.empty:
         raise ValueError(f"FinMind 沒有回傳 {symbol} 的日K資料，請確認代號是否正確")
-
     df = df.rename(columns={"date": "Date", "open": "Open", "max": "High",
                             "min": "Low", "close": "Close", "Trading_Volume": "Volume"})
     df["Date"] = pd.to_datetime(df["Date"])
@@ -89,9 +78,9 @@ def apply_split_adjustment(df, symbol):
     return df, notes
 
 
-def load_price(symbol, token):
-    """讀取標的日K並完成還原。回傳 (日K, 提示訊息清單)。"""
-    df, notes = apply_split_adjustment(fetch_daily(symbol, token), symbol)
+def prepare_price(raw, symbol):
+    """原始日K → (還原後日K, 提示訊息清單)。"""
+    df, notes = apply_split_adjustment(raw, symbol)
     chg = df["Close"].pct_change().abs()
     for dt, v in chg[chg > JUMP_WARN_LIMIT].items():
         notes.append(("warn", f"{dt:%Y-%m-%d} 單日價格變動 {v*100:.1f}%，可能有尚未還原的分割或減資，"
@@ -101,24 +90,11 @@ def load_price(symbol, token):
     return df, notes
 
 
+def load_price(symbol, token):
+    """抓取並還原標的日K。回傳 (日K, 提示訊息清單)。"""
+    return prepare_price(fetch_daily(symbol, token), symbol)
+
+
 def load_benchmark(bench_id, token):
-    """讀取大盤（預設 TAIEX 加權指數）日K。"""
-    df, _ = apply_split_adjustment(fetch_daily(bench_id, token), bench_id)
-    return df
-
-
-def resample_bars(df, timeframe="D"):
-    """日線直接回傳；週線以「週一到週日」為一週合併，日期標在該週最後一個交易日。"""
-    if timeframe != "W":
-        return df.copy()
-    week = df.index.to_period("W-SUN")
-    g = df.groupby(week)
-    out = pd.DataFrame({
-        "Open": g["Open"].first(),
-        "High": g["High"].max(),
-        "Low": g["Low"].min(),
-        "Close": g["Close"].last(),
-        "Volume": g["Volume"].sum(),
-    })
-    out.index = pd.DatetimeIndex(df.index.to_series().groupby(week).max().values, name="Date")
-    return out
+    """讀取大盤（TAIEX 加權指數）日K。"""
+    return prepare_price(fetch_daily(bench_id, token), bench_id)[0]

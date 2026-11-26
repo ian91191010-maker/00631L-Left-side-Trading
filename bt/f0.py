@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""轉折 F0：用台指期的「當月轉折」當 00631L 的進出場指標（新增頁面用；不影響原本三個頁面）。
+"""轉折 F0：用台指期的「當月轉折」當 00631L 的進出場指標（網頁 app.py 與前向記錄共用）。
 
 規則（與研究回測 dna-audit futures/etf_apply.py 的 F0 相同）
 - 訊號序列＝台指期近月連續合約（一般時段、不調整價差）。
@@ -14,15 +14,14 @@
 """
 import numpy as np
 import pandas as pd
-import requests
-import streamlit as st
 
+from . import costs
 from . import data as D
+from . import finmind
 
-VERSION = "1"
-TX_START = "2014-06-01"      # 00631L 2014-11 上市；N 需要前 2 個完整月，所以往前多抓
-BUY_FEE = 0.001425 * 0.3     # 手續費 3 折
-SELL_FEE = 0.001425 * 0.3 + 0.001   # ＋ETF 證交稅 0.1%
+TX_START = pd.Timestamp("2014-06-01")   # 00631L 2014-11 上市；N 需要前 2 個完整月，所以往前多抓
+BUY_FEE = costs.BUY_COST
+SELL_FEE = costs.SELL_COST
 
 
 # ----------------------------------------------------------------------
@@ -46,23 +45,26 @@ def normalize_tx(rows):
     return df.drop_duplicates(["date", "contract", "session"], keep="last").sort_values(["date", "contract"])
 
 
-@st.cache_data(show_spinner=False, ttl=3 * 3600)
-def fetch_tx(token):
-    """抓台指期日資料（依年份分段，避免單次要求過長）。失敗會丟出錯誤，不會被快取。"""
+def tx_years(today=None):
+    """需要抓的年份清單（2014 到今年）。"""
+    today = pd.Timestamp(today or D.today_tw())
+    return list(range(TX_START.year, today.year + 1))
+
+
+def fetch_tx_year(year, token, today=None):
+    """抓某一年的台指期日資料（原始列）。過去的年份資料不會再變，網頁層會長期快取。"""
+    today = pd.Timestamp(today or D.today_tw())
+    s = max(pd.Timestamp(year=year, month=1, day=1), TX_START)
+    e = min(pd.Timestamp(year=year, month=12, day=31), today)
+    return finmind.request("TaiwanFuturesDaily", "TX", s.date(), e.date(), token)
+
+
+def fetch_tx(token, fetch_year=None):
+    """抓 2014 至今的台指期並整理。fetch_year(year, token) 可換成有快取的版本（網頁用）。"""
+    fetch_year = fetch_year or fetch_tx_year
     rows = []
-    s = pd.Timestamp(TX_START)
-    today = pd.Timestamp(D.today_tw())
-    while s <= today:
-        e = min(pd.Timestamp(year=s.year, month=12, day=31), today)
-        res = requests.get(D.FINMIND_URL, headers={"Authorization": f"Bearer {token}"}, timeout=60,
-                           params={"dataset": "TaiwanFuturesDaily", "data_id": "TX",
-                                   "start_date": s.strftime("%Y-%m-%d"), "end_date": e.strftime("%Y-%m-%d")})
-        res.raise_for_status()
-        payload = res.json()
-        if payload.get("status", 200) != 200:
-            raise RuntimeError(f"FinMind 回應錯誤（台指期 {s:%Y}）：{payload.get('msg', payload.get('status'))}")
-        rows += payload.get("data", [])
-        s = e + pd.Timedelta(days=1)
+    for y in tx_years():
+        rows += fetch_year(y, token)
     tx = normalize_tx(rows)
     if tx.empty:
         raise ValueError("FinMind 沒有回傳台指期資料")

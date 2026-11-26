@@ -62,7 +62,9 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add data/forward_log.csv
             git commit -m "forward record: $(TZ=Asia/Taipei date +%Y-%m-%d)"
-            git push
+            # 私人庫可能同時推了 g5 資料：先把遠端的新提交接上再推，推失敗就重試一次
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push || { sleep 10; git pull --rebase origin "${GITHUB_REF_NAME}"; git push; }
           else
             echo "沒有新的記錄。"
           fi
