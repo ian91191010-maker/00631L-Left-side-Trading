@@ -34,14 +34,31 @@ def risk_gauge(taiex):
     return out
 
 
+G5_COLS = ["g5_close", "g5_min"]
+
+
+def empty_g5():
+    return pd.DataFrame(columns=G5_COLS, index=pd.DatetimeIndex([], name="date"), dtype=float)
+
+
 def load_g5(path=G5_PATH):
-    """讀取風控指標資料。沒有檔案或沒有資料時回傳空表。"""
+    """讀取風控指標資料。回傳 (資料表, 錯誤訊息或 None)。
+
+    沒有檔案、沒有資料列時回傳空表；檔案壞掉（欄位缺、日期格式錯）也回傳空表並附錯誤訊息，
+    不讓整頁當掉。日期無法解析的列會被略過。
+    """
     path = Path(path)
-    cols = ["g5_close", "g5_min"]
     if not path.exists() or path.stat().st_size == 0:
-        return pd.DataFrame(columns=cols, index=pd.DatetimeIndex([], name="date"))
-    df = pd.read_csv(path, dtype={"date": str})
-    df["date"] = pd.to_datetime(df["date"])
-    for c in cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.drop_duplicates("date", keep="last").set_index("date").sort_index()[cols]
+        return empty_g5(), None
+    try:
+        df = pd.read_csv(path, dtype={"date": str})
+        missing = [c for c in ["date"] + G5_COLS if c not in df.columns]
+        if missing:
+            return empty_g5(), f"風控指標檔缺少欄位：{', '.join(missing)}"
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"])
+        for c in G5_COLS:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df.drop_duplicates("date", keep="last").set_index("date").sort_index()[G5_COLS], None
+    except Exception as e:  # noqa: BLE001  檔案格式錯誤的種類很多，一律降級成空表
+        return empty_g5(), f"風控指標檔讀取失敗：{type(e).__name__}"

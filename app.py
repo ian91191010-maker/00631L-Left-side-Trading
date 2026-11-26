@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
-"""00631L Signal 頁面：00631L 的進出場訊號、K 線與兩個指標圖。
+"""00631L Signal：00631L 的進出場訊號、K 線與兩個指標圖（整個網站只有這一頁）。
 
-判斷邏輯在 bt/f0.py；指標資料在 bt/gauges.py；這個檔案只負責介面。
-這一頁沒有側邊欄，導覽放在頁面最下方。
+判斷邏輯在 bt/f0.py；指標資料在 bt/gauges.py；快取在 ui/cache.py；這個檔案只負責介面。
 """
 import json
-import sys
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -15,13 +12,13 @@ import streamlit as st
 import streamlit.components.v1 as components
 from plotly.subplots import make_subplots
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from bt import costs
+from bt import data as D
+from bt import f0 as F
+from bt import gauges as G
+from bt.finmind import FinMindError
+from ui import cache as UC
 
-from bt import data as D          # noqa: E402
-from bt import f0 as F            # noqa: E402
-from bt import gauges as G        # noqa: E402
-
-TICKER = "00631L"
 CHART_RANGES = {"近 3 個月": 63, "近 6 個月": 126, "近 1 年": 252, "近 2 年": 504, "近 5 年": 1260, "上市以來": 0}
 UP, DOWN = "#ef5350", "#26a69a"           # 紅漲綠跌
 PROFIT_FILL = "rgba(239, 83, 80, 0.14)"   # 獲利：淺紅
@@ -29,8 +26,7 @@ LOSS_FILL = "rgba(38, 166, 154, 0.16)"    # 虧損：淺綠
 SPLIT_DATE = "2020-10-30"                 # 績效對照的前後段分界
 ROW_HEIGHTS = [0.46, 0.18, 0.18, 0.18]
 
-st.set_page_config(page_title="00631L Signal", page_icon="📐", layout="wide", initial_sidebar_state="collapsed")
-st.markdown("""
+PAGE_CSS = """
 <style>
 [data-testid="stSidebar"], [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"],
 [data-testid="stSidebarNav"] {display: none !important;}
@@ -43,26 +39,22 @@ st.markdown("""
 .signal-card .state {font-size: 2.6rem; font-weight: 700; line-height: 1.1;}
 .signal-card .price {font-size: 2.6rem; font-weight: 700; text-align: right;
                      font-variant-numeric: tabular-nums; line-height: 1.1;}
+.signal-card .tag {font-size: 1rem; font-weight: 600; margin-left: 10px; padding: 2px 8px;
+                   border-radius: 6px; border: 1px solid currentColor; opacity: 0.7; vertical-align: middle;}
 .signal-card .asof {font-size: 0.95rem; opacity: 0.75; text-align: right; margin-top: 4px;}
 @media (max-width: 640px) {
     .signal-card .state, .signal-card .price {font-size: 2rem;}
     .signal-card .price, .signal-card .asof {text-align: left;}
 }
 </style>
-""", unsafe_allow_html=True)
+"""
 
 
-@st.cache_data(show_spinner=False, ttl=3 * 3600)
-def get_results(token):
-    price, notes = D.load_price(TICKER, token)
-    sig = F.compute_f0(F.fetch_tx(token))
-    taiex = D.load_benchmark("TAIEX", token)
-    return price, sig, G.risk_gauge(taiex), notes
-
-
-@st.cache_data(show_spinner=False, ttl=1800)
-def get_g5(mtime):
-    return G.load_g5()
+def safe_message(e):
+    """可以公開顯示的錯誤文字：已知錯誤照原文（不含 Token），其他只顯示類型。"""
+    if isinstance(e, (FinMindError, ValueError)):
+        return str(e)
+    return f"資料處理發生錯誤（{type(e).__name__}）"
 
 
 def describe_state(sig):
@@ -219,6 +211,9 @@ show(D.d.length - 1);
 
 
 # ===== 介面 =====
+st.set_page_config(page_title="00631L Signal", page_icon="📐", layout="wide", initial_sidebar_state="collapsed")
+st.markdown(PAGE_CSS, unsafe_allow_html=True)
+
 try:
     token = st.secrets["FINMIND_TOKEN"]
 except Exception:
@@ -226,18 +221,21 @@ except Exception:
 
 head_l, head_r = st.columns([5, 2], vertical_alignment="center")
 head_l.markdown("## 00631L Signal")
-if head_r.button("🔄 重新取得最新資料", help="資料預設每 3 小時自動更新；按這裡可立即更新。"):
-    st.cache_data.clear()
+if head_r.button("🔄 重新取得最新資料", help="資料每 2 小時自動更新；按這裡可立即更新（全站 10 分鐘內限按一次）。"):
+    if token:
+        ok, msg = UC.refresh(token)
+        (st.toast if ok else st.info)(msg)
 
 if not token:
     st.error("尚未設定 FinMind API Token。請到 App 設定 → Secrets 貼上：`FINMIND_TOKEN = \"你的token\"`")
     st.stop()
 
+# ---------- 主要資料（失敗就無法顯示訊號）----------
 try:
     with st.spinner("正在取得資料並計算訊號…"):
-        price, sig, gauge, notes = get_results(token)
+        price, sig, notes = UC.signal_core(token)
 except Exception as e:
-    st.error(f"資料取得失敗：{e}")
+    st.error(f"資料取得失敗：{safe_message(e)}")
     st.caption("可能是網路、FinMind 服務或 Token 額度問題。請稍後按右上角的「重新取得最新資料」。")
     st.stop()
 
@@ -245,9 +243,25 @@ for level, msg in notes:
     if level == "warn":
         st.warning(msg)
 
+# ---------- 參考資料（失敗只顯示提醒，不影響訊號）----------
+try:
+    gauge = UC.risk_gauge(token)
+except Exception as e:
+    gauge = pd.DataFrame(columns=["DIF", "DIF_HI", "DIF_LO"], dtype=float)
+    st.warning(f"風險指標暫時無法取得（不影響進出場訊號）：{safe_message(e)}")
+g5, g5_err = UC.g5_table(G.G5_PATH.stat().st_mtime if G.G5_PATH.exists() else 0)
+if g5_err:
+    st.warning(f"{g5_err}（不影響進出場訊號）")
+
 sig = sig.dropna(subset=["N"])
+if sig.empty or price.empty:
+    st.error("資料不足，無法計算訊號（台指期或 00631L 沒有有效資料）。")
+    st.stop()
 start = max(price.index[0], sig.index[0])
 p = price.loc[start:].copy()
+if p.empty:
+    st.error("00631L 與台指期沒有重疊的交易日，無法計算訊號。")
+    st.stop()
 hold = F.align(sig, p)
 ret, trades = F.simulate(p, hold)
 p["Entry"] = (hold.diff().fillna(hold) > 0)
@@ -256,17 +270,19 @@ p["Exit"] = (hold.diff().fillna(0) < 0)
 title, accent = describe_state(sig)
 r_, g_, b_ = int(accent[1:3], 16), int(accent[3:5], 16), int(accent[5:7], 16)
 last_tx = sig.index[-1]
+provisional = last_tx == pd.Timestamp(D.today_tw())
+state_html = f'{title}<span class="tag">暫定</span>' if provisional else title
 st.markdown(f"""
 <div class="signal-card" style="--accent: {accent}; --tint: rgba({r_}, {g_}, {b_}, 0.16);">
-  <div class="state">{title}</div>
+  <div class="state">{state_html}</div>
   <div>
     <div class="price">{p['Close'].iat[-1]:.2f}</div>
     <div class="asof">{p.index[-1]:%Y-%m-%d}｜{last_tx:%Y-%m-%d}</div>
   </div>
 </div>
 """, unsafe_allow_html=True)
-if last_tx == pd.Timestamp(D.today_tw()):
-    st.caption(f"台指期 {last_tx:%Y-%m-%d} 的結算價是今天剛取得的，可能還沒定案，正式訊號以隔天早上的資料為準。")
+if provisional:
+    st.caption(f"暫定：台指期 {last_tx:%Y-%m-%d} 的結算價是今天剛取得的，可能還沒定案，正式訊號以隔天早上的資料為準。")
 
 c1, c2, c3 = st.columns(3)
 c1.metric("台指期收盤（結算價）", f"{sig['Close'].iat[-1]:,.0f}")
@@ -274,16 +290,24 @@ c2.metric("當月轉折", f"{sig['N'].iat[-1]:,.0f}")
 c3.metric("距離轉折", f"{sig['Gap'].iat[-1]:+.2f}%", "在轉折之上" if sig["Target"].iat[-1] > 0 else "在轉折之下",
           delta_color="off")
 
-range_label = st.segmented_control("顯示區間", list(CHART_RANGES), default="近 1 年", label_visibility="collapsed")
-days = CHART_RANGES[range_label or "近 1 年"]
-view = p.tail(days) if days > 0 else p
-g5 = get_g5(G.G5_PATH.stat().st_mtime if G.G5_PATH.exists() else 0)
-fig, chart_data, txt_color = build_chart(view, sig, gauge, g5, trades)
-plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn", div_id="pc",
-                        config={"displaylogo": False, "scrollZoom": True, "displayModeBar": False})
-html = (CHART_HTML.replace("__TXT__", txt_color).replace("__PLOT__", plot_html)
-        .replace("__DATA__", json.dumps(chart_data, allow_nan=False)).replace("__UP__", UP).replace("__DOWN__", DOWN))
-components.html(html, height=1000)
+
+@st.fragment
+def chart_section(p, sig, gauge, g5, trades):
+    """切換顯示區間時只重畫這一區，不重算整頁。"""
+    range_label = st.segmented_control("顯示區間", list(CHART_RANGES), default="近 1 年",
+                                       label_visibility="collapsed")
+    days = CHART_RANGES[range_label or "近 1 年"]
+    view = p.tail(days) if days > 0 else p
+    fig, chart_data, txt_color = build_chart(view, sig, gauge, g5, trades)
+    plot_html = fig.to_html(full_html=False, include_plotlyjs="cdn", div_id="pc",
+                            config={"displaylogo": False, "scrollZoom": True, "displayModeBar": False})
+    html = (CHART_HTML.replace("__TXT__", txt_color).replace("__PLOT__", plot_html)
+            .replace("__DATA__", json.dumps(chart_data, allow_nan=False)).replace("__UP__", UP)
+            .replace("__DOWN__", DOWN))
+    components.html(html, height=1000)
+
+
+chart_section(p, sig, gauge, g5, trades)
 
 tab_log, tab_perf = st.tabs(["近期交易紀錄", "績效對照"])
 with tab_log:
@@ -307,6 +331,7 @@ with tab_log:
 
         st.dataframe(log.style.format({"進場價": "{:.2f}", "出場價": "{:.2f}", "漲跌幅": "{:+.2f}%"})
                      .apply(row_style, axis=1), hide_index=True)
+        st.caption("漲跌幅已扣成本；持有中的交易以最新收盤價計算、尚未扣賣出成本。")
 
 with tab_perf:
     bh = F.buy_hold(p)
@@ -319,9 +344,10 @@ with tab_perf:
             if len(x) < 30:
                 continue
             rows[f"{label}｜{name}"] = F.stats(x, None if hh is None else hh.loc[sl])
-    perf = pd.DataFrame(rows).T
-    st.dataframe(perf.style.format({"總報酬": "{:,.0f}%", "年化報酬": "{:.1f}%", "最大回撤": "{:.1f}%",
-                                    "報酬回撤比": "{:.2f}", "持有比例": "{:.0f}%"}, na_rep="—"))
+    if rows:
+        perf = pd.DataFrame(rows).T
+        st.dataframe(perf.style.format({"總報酬": "{:,.0f}%", "年化報酬": "{:.1f}%", "最大回撤": "{:.1f}%",
+                                        "報酬回撤比": "{:.2f}", "持有比例": "{:.0f}%"}, na_rep="—"))
     eq = pd.DataFrame({"策略": (1 + ret).cumprod(), "買進持有": (1 + bh).cumprod()})
     fig2 = go.Figure()
     for col, color in (("策略", "#2962FF"), ("買進持有", "#9E9E9E")):
@@ -332,16 +358,12 @@ with tab_perf:
     st.plotly_chart(fig2, width="stretch", config={"displaylogo": False})
 
 st.divider()
-nav = st.columns(4)
-nav[0].page_link("app - 00631L-Left-side-Trading.py", label="主頁")
-nav[1].page_link("pages/1_策略回測.py", label="策略回測")
-nav[2].page_link("pages/2_審計系統二.py", label="審計系統二")
-nav[3].page_link("pages/4_前向記錄.py", label="前向記錄")
 with st.expander("說明"):
-    st.markdown("""
+    st.markdown(f"""
 - 資料來源：FinMind（台指期逐日結算價、00631L 與加權指數日 K）。00631L 只做分割還原，不配息。
 - 訊號在台指期收盤後判定，下一個交易日 00631L 開盤成交；只做多、全額進出。
-- 成本：手續費 0.1425% × 3 折，賣出另加證交稅 0.1%。績效已扣成本，空手時現金不計利息。
+- 成本：{costs.describe()}。績效已扣成本，空手時現金不計利息。
+- 資料每 2 小時自動更新；已結束年份的台指期資料長期保存，不重複下載。
 - K 線底色：淺紅＝該次交易獲利，淺綠＝虧損（持有中以最新收盤價計）。黃色三角＝買進，藍色三角＝賣出。
 - 圖表：四張圖共用橫軸，滑鼠移上去時垂直虛線會同時出現在四張圖，K 線資訊顯示在 K 線圖上方。
 - 風險指標、風控指標為參考指標，僅供對照，不構成投資建議。
