@@ -1,6 +1,6 @@
-streamlit>=1.50
-pandas
-numpy
-plotly
-requests
-ta
+# 鎖主版本：上限避免未來大改版直接把網站弄壞；下限是已實測可跑的版本
+streamlit>=1.50,<2
+pandas>=2.2.3,<4
+numpy>=2.0,<3
+plotly>=6.0,<8
+requests>=2.31,<3
