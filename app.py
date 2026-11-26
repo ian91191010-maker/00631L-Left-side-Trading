@@ -129,17 +129,16 @@ def build_chart(p, tx, gauge, g5, trades):
             continue
         fig.add_vrect(x0=max(tr.entry_date, lo), x1=min(x1, hi), fillcolor=PROFIT_FILL if tr.ret > 0 else LOSS_FILL,
                       layer="below", line_width=0, row=1, col=1)
-    cross_k = len(fig.layout.shapes)      # 十字線：垂直虛線橫跨四張圖，由 JS 隨滑鼠移動
-    fig.add_shape(type="line", xref="x", yref="paper", x0=lo, x1=lo, y0=0, y1=1, visible=False,
-                  line=dict(color=txt, width=1, dash="dot"))
-    labels = {2: "台指期收盤（藍）／當月轉折（紅）", 3: "風險指標", 4: "風控指標"}
-    for row, label in labels.items():
-        dom = fig.layout[f"yaxis{row}"].domain
-        fig.add_annotation(text=label, xref="paper", yref="paper", x=0, y=dom[1] + 0.004, xanchor="left",
-                           yanchor="bottom", showarrow=False, font=dict(color=txt, size=12))
-    n_note = len(fig.layout.annotations) - 3            # 前面的「資料尚未送入」不算
-    missing = [d.strftime("%Y-%m-%d") for d in pd.date_range(lo, hi, freq="D").difference(idx)]
-    fig.update_xaxes(rangebreaks=[dict(values=missing)], gridcolor=grid, linecolor=grid, tickfont=dict(color=txt),
+    # 十字線與三張副圖的標籤由 JS 畫在圖上方的文字層，滑鼠移動時不重畫 Plotly 圖（避免 lag）
+    doms = {row: list(fig.layout[f"yaxis{row}"].domain) for row in (2, 3, 4)}
+    # 隱藏週末與休市日：範圍內沒有週末交易日時，用「隱藏週末」一條規則＋平日休市日（快很多）；
+    # 2014～2018 有 9 個週六補班交易日，範圍含到它們時改用逐日清單，K 棒一根都不少。
+    if (idx.weekday >= 5).any():
+        breaks = [dict(values=[d.strftime("%Y-%m-%d") for d in pd.date_range(lo, hi, freq="D").difference(idx)])]
+    else:
+        holidays = [d.strftime("%Y-%m-%d") for d in pd.bdate_range(lo, hi).difference(idx)]
+        breaks = [dict(bounds=["sat", "mon"])] + ([dict(values=holidays)] if holidays else [])
+    fig.update_xaxes(rangebreaks=breaks, gridcolor=grid, linecolor=grid, tickfont=dict(color=txt),
                      tickformatstops=[dict(dtickrange=[None, "M1"], value="%m-%d"),
                                       dict(dtickrange=["M1", "M12"], value="%Y-%m"),
                                       dict(dtickrange=["M12", None], value="%Y")])
@@ -151,44 +150,76 @@ def build_chart(p, tx, gauge, g5, trades):
         "d": [d.strftime("%Y-%m-%d") for d in idx],
         "o": _clean(p["Open"]), "h": _clean(p["High"]), "l": _clean(p["Low"]), "c": _clean(p["Close"]),
         "tx": _clean(t["Close"], 0), "n": _clean(t["N"], 0), "dif": _clean(g["DIF"], 0), "g5": _clean(r["g5_close"]),
-        "cross": cross_k, "note": n_note,
+        "dom": doms,
     }
     return fig, data, txt
 
 
 CHART_HTML = """
 <meta charset="utf-8">
-<div id="strip" style="font:14px/1.5 'Source Sans Pro',sans-serif;color:__TXT__;min-height:24px;
-     font-variant-numeric:tabular-nums;margin:0 0 4px 4px"></div>
+<style>
+#strip {font:14px/1.5 'Source Sans Pro',sans-serif;min-height:24px;font-variant-numeric:tabular-nums;margin:0 0 4px 4px}
+#box {position:relative}
+.ov {position:absolute;pointer-events:none;z-index:5}
+.lbl {font:12px 'Source Sans Pro',sans-serif;white-space:nowrap;font-variant-numeric:tabular-nums}
+#vline {top:0;width:0;border-left:1px dotted;display:none}
+</style>
+<div id="strip" style="color:__TXT__"></div>
+<div id="box">
 __PLOT__
+<div id="vline" class="ov"></div>
+<div id="l2" class="ov lbl"></div><div id="l3" class="ov lbl"></div><div id="l4" class="ov lbl"></div>
+</div>
 <script>
+// 滑鼠移動時只改文字層（十字線、K 線資訊、三張副圖的數值），不呼叫 Plotly.relayout，圖表不重畫。
 var D = __DATA__, UPC = "__UP__", DNC = "__DOWN__";
-var gd = document.getElementById("pc"), ix = {};
+var gd = document.getElementById("pc"), box = document.getElementById("box"), ix = {};
+var vline = document.getElementById("vline"), L = {2: document.getElementById("l2"), 3: document.getElementById("l3"), 4: document.getElementById("l4")};
 D.d.forEach(function (s, i) { ix[s] = i; });
 function f(v, n) { return v === null ? "—" : Number(v).toLocaleString("en-US", {minimumFractionDigits: n, maximumFractionDigits: n}); }
+function size() {
+  var s = gd._fullLayout && gd._fullLayout._size;
+  return s || {l: 8, t: 8, w: gd.clientWidth - 16, h: gd.clientHeight - 52};
+}
+function place() {            // 依目前圖表尺寸擺好標籤與十字線的位置（縮放視窗時也會重算）
+  var s = size();
+  [2, 3, 4].forEach(function (r) {
+    L[r].style.left = s.l + "px";
+    L[r].style.top = (s.t + (1 - D.dom[r][1]) * s.h - 18) + "px";
+  });
+  vline.style.top = s.t + "px"; vline.style.height = s.h + "px";
+}
+var last = -1;
 function show(i) {
+  if (i === last) return;
+  last = i;
   var prev = i > 0 ? D.c[i - 1] : D.o[i], chg = (D.c[i] / prev - 1) * 100, col = D.c[i] >= prev ? UPC : DNC;
   document.getElementById("strip").innerHTML =
     '<span style="opacity:.65">' + D.d[i] + '</span>　開 ' + f(D.o[i], 2) + '　高 ' + f(D.h[i], 2) + '　低 ' + f(D.l[i], 2) +
     '　收 <span style="color:' + col + '">' + f(D.c[i], 2) + '（' + (chg >= 0 ? "+" : "") + f(chg, 2) + '%）</span>';
-  var a = D.note, u = {};
-  u["annotations[" + a + "].text"] = "台指期收盤（藍）／當月轉折（紅）　" + f(D.tx[i], 0) + " / " + f(D.n[i], 0);
-  u["annotations[" + (a + 1) + "].text"] = "風險指標　" + f(D.dif[i], 0);
-  u["annotations[" + (a + 2) + "].text"] = "風控指標　" + (D.g5[i] === null ? "—" : f(D.g5[i], 2));
-  Plotly.relayout(gd, u);
+  L[2].textContent = "台指期收盤（藍）／當月轉折（紅）　" + f(D.tx[i], 0) + " / " + f(D.n[i], 0);
+  L[3].textContent = "風險指標　" + f(D.dif[i], 0);
+  L[4].textContent = "風控指標　" + (D.g5[i] === null ? "—" : f(D.g5[i], 2));
 }
-function cross(x) {
-  var u = {}; u["shapes[" + D.cross + "].x0"] = x; u["shapes[" + D.cross + "].x1"] = x; u["shapes[" + D.cross + "].visible"] = true;
-  Plotly.relayout(gd, u);
-}
-gd.on("plotly_hover", function (e) {
+var pending = null, queued = false;
+function frame() {             // 每個畫面更新週期最多處理一次滑鼠事件
+  queued = false;
+  if (!pending) return;
+  var e = pending; pending = null;
+  if (e.hide) { vline.style.display = "none"; show(D.d.length - 1); return; }
   var x = String(e.points[0].x).slice(0, 10), i = ix[x];
   if (i === undefined) return;
-  cross(x); show(i);
-});
-gd.on("plotly_unhover", function () {
-  var u = {}; u["shapes[" + D.cross + "].visible"] = false; Plotly.relayout(gd, u); show(D.d.length - 1);
-});
+  if (e.event && e.event.clientX !== undefined) {
+    var s = size(), px = e.event.clientX - box.getBoundingClientRect().left;
+    if (px >= s.l && px <= s.l + s.w) { vline.style.left = px + "px"; vline.style.display = "block"; }
+  }
+  show(i);
+}
+function queue(e) { pending = e; if (!queued) { queued = true; requestAnimationFrame(frame); } }
+gd.on("plotly_hover", queue);
+gd.on("plotly_unhover", function () { queue({hide: true}); });
+gd.on("plotly_relayouting", function () { vline.style.display = "none"; });   // 拖曳中先藏十字線
+gd.on("plotly_afterplot", place);
 function applyTheme() {
   var col = "#31333f";
   try { col = getComputedStyle(window.parent.document.querySelector(".stApp")).color; }
@@ -196,15 +227,16 @@ function applyTheme() {
   var m = col.match(/[0-9]+/g).map(Number), lum = 0.299 * m[0] + 0.587 * m[1] + 0.114 * m[2];
   var grid = lum > 128 ? "rgba(255,255,255,0.10)" : "rgba(0,0,0,0.08)", u = {"font.color": col};
   document.getElementById("strip").style.color = col;
+  [2, 3, 4].forEach(function (r) { L[r].style.color = col; });
+  vline.style.borderColor = col;
   ["", "2", "3", "4"].forEach(function (k) {
     u["xaxis" + k + ".tickfont.color"] = col; u["xaxis" + k + ".gridcolor"] = grid;
     u["yaxis" + k + ".tickfont.color"] = col; u["yaxis" + k + ".gridcolor"] = grid;
   });
-  for (var j = 0; j < 3; j++) u["annotations[" + (D.note + j) + "].font.color"] = col;
-  u["shapes[" + D.cross + "].line.color"] = col;
-  Plotly.relayout(gd, u);
+  Plotly.relayout(gd, u);       // 只在載入時執行一次
 }
 applyTheme();
+place();
 show(D.d.length - 1);
 </script>
 """
