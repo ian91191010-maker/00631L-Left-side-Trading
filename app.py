@@ -80,6 +80,11 @@ def _clean(s, nd=2):
     return [None if pd.isna(v) else round(float(v), nd) for v in s]
 
 
+def _ds(x):
+    """日期 → 'YYYY-MM-DD'（類別軸的格子名稱）。"""
+    return pd.Timestamp(x).strftime("%Y-%m-%d")
+
+
 def build_chart(p, tx, gauge, g5, trades):
     """四張圖共用同一條橫軸：K 線、台指期與轉折、風險指標、風控指標。"""
     txt, grid = theme_colors()
@@ -127,21 +132,16 @@ def build_chart(p, tx, gauge, g5, trades):
         x1 = hi if pd.isna(tr.exit_date) else tr.exit_date
         if x1 < lo or tr.entry_date > hi:
             continue
-        fig.add_vrect(x0=max(tr.entry_date, lo), x1=min(x1, hi), fillcolor=PROFIT_FILL if tr.ret > 0 else LOSS_FILL,
-                      layer="below", line_width=0, row=1, col=1)
+        fig.add_vrect(x0=_ds(max(tr.entry_date, lo)), x1=_ds(min(x1, hi)),
+                      fillcolor=PROFIT_FILL if tr.ret > 0 else LOSS_FILL, layer="below", line_width=0, row=1, col=1)
     # 十字線與三張副圖的標籤由 JS 畫在圖上方的文字層，滑鼠移動時不重畫 Plotly 圖（避免 lag）
     doms = {row: list(fig.layout[f"yaxis{row}"].domain) for row in (2, 3, 4)}
-    # 隱藏週末與休市日：範圍內沒有週末交易日時，用「隱藏週末」一條規則＋平日休市日（快很多）；
-    # 2014～2018 有 9 個週六補班交易日，範圍含到它們時改用逐日清單，K 棒一根都不少。
-    if (idx.weekday >= 5).any():
-        breaks = [dict(values=[d.strftime("%Y-%m-%d") for d in pd.date_range(lo, hi, freq="D").difference(idx)])]
-    else:
-        holidays = [d.strftime("%Y-%m-%d") for d in pd.bdate_range(lo, hi).difference(idx)]
-        breaks = [dict(bounds=["sat", "mon"])] + ([dict(values=holidays)] if holidays else [])
-    fig.update_xaxes(rangebreaks=breaks, gridcolor=grid, linecolor=grid, tickfont=dict(color=txt),
-                     tickformatstops=[dict(dtickrange=[None, "M1"], value="%m-%d"),
-                                      dict(dtickrange=["M1", "M12"], value="%Y-%m"),
-                                      dict(dtickrange=["M12", None], value="%Y")])
+    # 橫軸用「交易日」當刻度（類別軸）：每個交易日一格，週末與休市日本來就不存在，
+    # 不需要 Plotly 的 rangebreaks（它在拖曳、縮放時會重算上千個缺口，造成 lag、跳動、位置偏移）。
+    for trace in fig.data:
+        trace.x = [_ds(x) for x in trace.x]
+    fig.update_xaxes(type="category", categoryorder="array", categoryarray=[_ds(d) for d in idx],
+                     nticks=8, tickangle=0, gridcolor=grid, linecolor=grid, tickfont=dict(color=txt))
     fig.update_yaxes(gridcolor=grid, zeroline=False, tickfont=dict(color=txt), automargin=True)
     fig.update_layout(height=940, xaxis_rangeslider_visible=False, margin=dict(l=8, r=8, t=8, b=44),
                       dragmode="pan", hovermode="x", showlegend=False, paper_bgcolor="rgba(0,0,0,0)",
@@ -150,7 +150,7 @@ def build_chart(p, tx, gauge, g5, trades):
         "d": [d.strftime("%Y-%m-%d") for d in idx],
         "o": _clean(p["Open"]), "h": _clean(p["High"]), "l": _clean(p["Low"]), "c": _clean(p["Close"]),
         "tx": _clean(t["Close"], 0), "n": _clean(t["N"], 0), "dif": _clean(g["DIF"], 0), "g5": _clean(r["g5_close"]),
-        "dom": doms,
+        "dom": doms, "hi": _clean(g["DIF_HI"], 0), "lo": _clean(g["DIF_LO"], 0),
     }
     return fig, data, txt
 
@@ -220,6 +220,31 @@ gd.on("plotly_hover", queue);
 gd.on("plotly_unhover", function () { queue({hide: true}); });
 gd.on("plotly_relayouting", function () { vline.style.display = "none"; });   // 拖曳中先藏十字線
 gd.on("plotly_afterplot", place);
+// 拖曳、縮放停下來 0.15 秒後，上面三張圖的縱軸自動貼合目前看得到的資料（只重畫一次）
+var fitTimer = null, fitting = false;
+function span(arrs, a, b) {
+  var lo = Infinity, hi = -Infinity;
+  arrs.forEach(function (arr) { for (var i = a; i <= b; i++) { var v = arr[i]; if (v !== null) { if (v < lo) lo = v; if (v > hi) hi = v; } } });
+  if (lo === Infinity) return null;
+  var pad = (hi - lo) * 0.06 || Math.abs(hi) * 0.02 || 1;
+  return [lo - pad, hi + pad];
+}
+function fitY() {
+  var r = gd._fullLayout.xaxis.range, n = D.d.length;
+  var a = Math.max(0, Math.ceil(r[0])), b = Math.min(n - 1, Math.floor(r[1]));
+  if (b < a) return;
+  var u = {}, y1 = span([D.l, D.h], a, b), y2 = span([D.tx, D.n], a, b), y3 = span([D.dif, D.hi, D.lo], a, b);
+  if (y1) { y1[0] = Math.min(y1[0], y1[0] * 0.985); u["yaxis.range"] = y1; }   // 留位置給買賣三角形
+  if (y2) u["yaxis2.range"] = y2;
+  if (y3) u["yaxis3.range"] = y3;
+  fitting = true; Plotly.relayout(gd, u).then(function () { fitting = false; }, function () { fitting = false; });
+}
+gd.on("plotly_relayout", function (e) {
+  if (fitting) return;
+  var keys = Object.keys(e || {});
+  if (!keys.some(function (k) { return k.indexOf("xaxis") === 0; })) return;
+  clearTimeout(fitTimer); fitTimer = setTimeout(fitY, 150);
+});
 function applyTheme() {
   var col = "#31333f";
   try { col = getComputedStyle(window.parent.document.querySelector(".stApp")).color; }
