@@ -430,10 +430,17 @@ gd.on("plotly_relayout", function (e) {
   if (!keys.some(function (k) { return k.indexOf("xaxis") === 0; })) return;
   clearTimeout(fitTimer); fitTimer = setTimeout(fitY, 150);
 });
+function pageColor() {           // 網頁目前的文字顏色（深色主題＝淺色字、淺色主題＝深色字）
+  try {
+    var d = window.parent.document, el = d.querySelector('[data-testid="stApp"]') || d.querySelector(".stApp");
+    if (el) return getComputedStyle(el).color;
+  } catch (e) {}
+  return "__TXT__";
+}
+var themeCol = null;
 function applyTheme() {
-  var col = "#31333f";
-  try { col = getComputedStyle(window.parent.document.querySelector(".stApp")).color; }
-  catch (e) { if (window.matchMedia("(prefers-color-scheme: dark)").matches) col = "#ece9e4"; }
+  var col = pageColor();
+  themeCol = col;
   var m = /^#([0-9a-f]{6})$/i.test(col) ? [0, 2, 4].map(function (k) { return parseInt(col.substr(1 + k, 2), 16); })
                                           : col.match(/[0-9.]+/g).map(Number);
   var lum = 0.299 * m[0] + 0.587 * m[1] + 0.114 * m[2];
@@ -454,6 +461,8 @@ function applyTheme() {
                      "increasing.fillcolor": "rgba(0,0,0,0)"}, u, LAY.k3);   // 只在載入時執行一次
 }
 applyTheme();
+// 使用者在頁面打開後切換深色／淺色主題時，圖表不會重新載入：每秒檢查一次，主題變了就重新上色
+setInterval(function () { if (pageColor() !== themeCol) applyTheme(); }, 1000);
 lvTag();
 place();
 show(D.d.length - 1);
