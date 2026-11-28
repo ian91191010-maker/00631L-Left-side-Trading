@@ -127,7 +127,7 @@ def turning_month(daily):
 
 
 def compute_f0(tx):
-    """每個台指期交易日收盤後的 F0 狀態。回傳含 Close、N、Gap、Target（1＝持有、0＝空手）。"""
+    """每個台指期交易日收盤後的 F0 狀態。回傳含 Close、N、Gap、Target（1＝持有、0＝空手），以及近月合約的 Open/High/Low。"""
     d = front_series(tx)
     out = pd.DataFrame(index=d.index)
     out["Close"] = d["Close"]
@@ -146,6 +146,8 @@ def compute_f0(tx):
     out["Target"] = tgt
     out["Gap"] = (out["Close"] / out["N"] - 1) * 100
     out["Contract"] = d["Contract"]
+    for c in ("Open", "High", "Low"):          # 近月合約的開高低（畫台指期 K 棒用，不影響訊號）
+        out[c] = d[c]
     return out
 
 
